@@ -23,6 +23,19 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+// RPC包含一个文件指针
+// Task和WorkerState的有用字段应该exported
+type Task struct {
+	TaskNum int
+	TaskType int // map: 1, reduce: 2
+	FName string
+	isDone bool
+}
+
+// WorkerState表示worker的状态,应该当作RPC调用的参数,coordinator根据WorkerState来安排tasks
+type WorkerState struct {
+	IsIdle bool 
+}
 
 
 // Cook up a unique-ish UNIX-domain socket name
