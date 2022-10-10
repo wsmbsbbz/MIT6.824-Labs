@@ -9,51 +9,139 @@ import "sync"
 
 const (
 	// Coordinator.state
-	MAPPING = 1
-	REDUCING = 2
+	CoorMapping = 1
+	CoorReducing = 2
+	CoorAllDone = 3
 
 	// Task.TaskType
-	MAP = 1
-	REDUCE = 2
+	TaskMap = 1
+	TaskReduce = 2
+	TaskAllDone = 3
+
+	// mapTask/reduceTask state
+	TaskWating = 0
+	TaskRunning = 1
+	TaskDone = 2
 )
 
 
 type Coordinator struct {
 	// Your definitions here.
-	files []MRFile
-	// TODO: 处理多个文件
-	filename string
-	// TODO: 拆分为NReduce个reduce文件
-	NReduce int
-	// map和reduce都完成之后,isDone的值才应该为true
-	isDone bool
-	state int // mapping: 1, reducing: 2
+	// NOTE: 处理多个文件
+	mu sync.Mutex
+	state int // mapping: 1, reducing: 2, allDone: 3
+
+	nMap int
+	mTasks []mapTask
+	mapDoneCount int
+	// NOTE: 拆分为nReduce个reduce文件
+	nReduce int
+	rTasks []reduceTask
+	reduceDoneCount int
+
 }
 
-type MRFile struct {
-	FName string
-	isDone bool
-	mu sync.Mutex
+type mapTask struct {
+	fName string
+	state int
+}
+
+type reduceTask struct {
+	taskNum int
+	state int
 }
 
 // Your code here -- RPC handlers for the worker to call.
 // args可以是一个表示worker的状态,
 // oldTask, newTask
-func (c *Coordinator) Coordinate(oldTask *Task, newTask *Task) error {
+func (c *Coordinator) Coordinate(oldTask Task, newTask *Task) error {
 	// TODO: 处理并发
-	log.Printf("New RPC call: %v\n", newTask)
-	log.Printf("oldTask: %v\n", oldTask)
-	// TODO: 处理oldTask
-	if oldTask.TaskNum == -1 {
-		
+	log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
+	log.Printf("c.Coordinate: newTask: %v\n", newTask)
+	// NOTE: 处理oldTask
+	c.coordinateOldTask(oldTask)
+	if c.mapDoneCount > len(c.mTasks) {
+		log.Printf("c.Coordinate: unvalid c.mapDoneCount %v with len(c.files) %v\n",
+			c.mapDoneCount, len(c.mTasks))
 	}
-	newTask.FName = c.filename
-	newTask.TaskType = 1
-	log.Println(newTask)
 
-	// TODO: 分配newTask
+	// NOTE: 分配newTask
+	c.coordinateNewTask(newTask)
+
 	// TODO: 目前是分配一个FName,需要改为为每个worker分配一个不同的FName
 	return nil
+}
+
+func (c *Coordinator) coordinateFile()  {
+	
+}
+
+// coordinatorOldTask获取c.mu锁,并在返回时Unlock
+func (c *Coordinator) coordinateOldTask(oldTask Task)  {
+	// 无oldTask,不处理,说明这个worker是第一次申请task
+	if oldTask.TaskType == 0 {
+		return
+	}
+	// 获取,释放 c.filesLock
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if oldTask.TaskNum < 0 {
+		log.Printf("coordinateOldTask: unvalid TaskNum %v\n", oldTask.TaskNum)
+	}
+
+	if oldTask.TaskType == TaskMap {
+		c.mTasks[oldTask.TaskNum].state = TaskDone
+		c.mapDoneCount++
+		if c.mapDoneCount == len(c.mTasks) {
+			c.state = CoorReducing
+		}
+	} else if oldTask.TaskType == TaskReduce {
+		c.rTasks[oldTask.TaskNum].state = TaskDone
+		c.reduceDoneCount++
+		if c.reduceDoneCount == c.nReduce {
+			c.state = CoorAllDone
+		}
+	} else if oldTask.TaskType == TaskAllDone {
+		log.Printf("coordinateOldTask: TaskAllDone %v\n", oldTask.TaskType)
+	} else {
+		log.Fatalf("coordinateOldTask: unvalid TaskType %v\n", oldTask.TaskType)
+	}
+}
+
+func (c *Coordinator) coordinateNewTask(newTask *Task)  {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.state == CoorMapping {
+		for i := 0; i < len(c.mTasks); i++ {
+			if c.mTasks[i].state == TaskWating {
+				c.mTasks[i].state = TaskRunning
+				newTask.TaskNum = i
+				newTask.TaskType = TaskMap
+				newTask.FName = c.mTasks[i].fName
+				newTask.NMap = c.nMap
+				newTask.NReduce = c.nReduce
+				break
+			}
+		}
+	} else if c.state == CoorReducing {
+		for i := 0; i < len(c.mTasks); i++ {
+			if c.mTasks[i].state == TaskWating {
+				c.mTasks[i].state = TaskRunning
+				newTask.TaskNum = i
+				newTask.TaskType = TaskReduce
+				newTask.FName = ""
+				newTask.NMap = c.nMap
+				newTask.NReduce = c.nReduce
+				break
+			}
+		}
+	} else if c.state == CoorAllDone {
+		newTask.TaskType = TaskAllDone
+	} else {
+		log.Fatalf("coordinateNewTask: unvalid c.state %v\n", c.state)
+	}
 }
 //
 // an example RPC handler.
@@ -90,9 +178,10 @@ func (c *Coordinator) Done() bool {
 	// ret := false
 
 	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-
-	return c.isDone
+	return c.state == CoorAllDone
 }
 
 //
@@ -101,11 +190,17 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{filename: files[0]}
-
 	// Your code here.
+	c := &Coordinator{state: CoorMapping, nMap: len(files), nReduce: nReduce}
+	for _, filename := range files{
+		c.mTasks = append(c.mTasks, mapTask{filename, TaskWating})
+	}
+	for i := 0; i < nReduce; i++ {
+		c.rTasks = append(c.rTasks, reduceTask{i, TaskWating})
+	}
+	log.Printf("MakeCoordinator: %v\n", c)
 
 
 	c.server()
-	return &c
+	return c
 }

@@ -1,12 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "io/ioutil"
-import "os"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -15,6 +19,25 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// type syncWriter struct {
+// 	mu sync.Mutex
+// 	writer io.Writer
+// }
+
+// func (w *syncWriter) Write(p []byte) (n int, err error) {
+// 	w.mu.Lock()
+// 	defer w.mu.Unlock()
+// 	return w.Write(p)
+// }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -40,39 +63,40 @@ func Worker(mapf func(string, string) []KeyValue,
 	oldTask := Task{}
 	newTask := &Task{}
 
-	// for true {
+	// for newTask.TaskType != TaskAllDone {
+	for true {
 		ok := call("Coordinator.Coordinate", oldTask, newTask)
 		if ok {
-			fmt.Printf("Handed in an old task: %v\n", oldTask)
-			fmt.Printf("Accepted a new task: %v\n", *newTask)
+			log.Printf("Handed in an old task: %v\n", oldTask)
+			log.Printf("Accepted a new task: %v\n", *newTask)
 		} else {
-			fmt.Printf("call failed!\n")
+			log.Printf("call failed!\n")
 		}
 
-		if newTask != nil {
-			if newTask.TaskType == 1 {
-				// NOTE: map
-				intermediate, err := workerMap(mapf, newTask.FName)
-				if err != nil {
-					// ERRO:
-					log.Fatal(err)
-				}
-				// TODO: mr-%d-0
-				filename := fmt.Sprintf("mr-%d-%d", newTask.TaskNum, 0)
-				file, ok := os.Create(filename)
-				if ok != nil {
-					log.Fatalf("cannot create %v", filename)
-				}
-				for i := 0; i < len(intermediate); i++ {
-					toWrite := fmt.Sprintf("%v %v\n", intermediate[i].Key, intermediate[i].Value)
-					file.WriteString(toWrite)
-				}
-				file.Close()
-			} else {
-				// TODO: reduce
-			}
+		if newTask.TaskType == TaskAllDone {
+			break
+		} else if newTask.TaskType == TaskMap {
+			// NOTE: map
+			// sWriters := []*syncWriter{}
+			// for i := 0; i < newTask.NReduce; i++ {
+				// filename := fmt.Sprintf("mr-%d-%d", newTask.TaskNum, i)
+				// filename := fmt.Sprintf("mr-%d", newTask.TaskNum)
+				// file, err := os.Create(filename)
+				// if err != nil {
+				// 	log.Fatalf("Worker: %v", err)
+				// }
+				// sw := &syncWriter{sync.Mutex{}, file}
+				// sWriters = append(sWriters, sw)
+			// }
+			kvFileName := fmt.Sprintf("mr-%d-%d", newTask.TaskNum, 0)
+			workerMap(mapf, newTask.FName, kvFileName)
+		} else if newTask.TaskType == TaskReduce {
+
+		} else if newTask.TaskType == 0 {
+			time.Sleep(time.Second)
 		}
-	// }
+		oldTask, newTask = *newTask, &Task{}
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
@@ -81,12 +105,15 @@ func Worker(mapf func(string, string) []KeyValue,
 
 // workerMap把filename和对应文件的内容传入mapf函数,并返回mapf函数运行的返回值
 // 这提供了一层封装,让workerMap只执行函数,但是不需要处理RPC
-func workerMap(mapf func(string, string) []KeyValue, filename string) ([]KeyValue, error) {
+func workerMap(mapf func(string, string) []KeyValue, filename string,
+	outputName string) error {
 	if mapf == nil {
 		// NOTE: []KeyValue可以为nil吗?
-		return nil, fmt.Errorf("workerMap: mapf is nil!");
+		return fmt.Errorf("workerMap: mapf is nil!");
 	}
 	intermediate := []KeyValue{}
+
+	// read from input file
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -98,8 +125,78 @@ func workerMap(mapf func(string, string) []KeyValue, filename string) ([]KeyValu
 	file.Close()
 	kva := mapf(filename, string(content))
 	intermediate = append(intermediate, kva...)
+
+	// output to outputName file
 	// TODO: 把kva写入mr-X-Y, where X is the Map task number, and Y is the reduce task number.
-	return intermediate, nil
+	// TODO: mr-%d-0
+	file, err = os.Create(outputName)
+	if err != nil {
+		log.Fatalf("cannot create %v", outputName)
+	}
+	enc := json.NewEncoder(file)
+	// for i := 0; i < len(intermediate); i++ {
+	for _, kv := range intermediate {
+		// TODO: 原子化写入
+		err := enc.Encode(&kv)
+		if err != nil {
+			log.Fatalf("enc.Encode\n")
+		}
+		// toWrite := fmt.Sprintf("%v %v\n", intermediate[i].Key, intermediate[i].Value)
+		// file.WriteString(toWrite)
+	}
+	file.Close()
+	return nil
+}
+
+func workerReduce(reducef func(string, []string) string, rTask *Task) {
+	// files := []*os.File{}
+	kva := []KeyValue{}
+	for i := 0; i < rTask.NReduce; i++ {
+		// TODO mr-X-Y
+		file, err := os.Open(fmt.Sprintf("mr-%d-%d", rTask.TaskNum, i))
+		if err != nil {
+			log.Fatalf("workerReduce: %v", err)
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+
+	sort.Sort(ByKey(kva))
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	mrOut, err := os.Create(fmt.Sprintf("mr-out-%d", rTask.TaskNum))
+	defer mrOut.Close()
+	if err != nil {
+		log.Printf("workerReduce: %v", err)
+	}
+
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(mrOut, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
 }
 
 //

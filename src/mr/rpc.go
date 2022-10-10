@@ -27,9 +27,12 @@ type ExampleReply struct {
 // Task和WorkerState的有用字段应该exported
 type Task struct {
 	TaskNum int
-	TaskType int // map: 1, reduce: 2
+	TaskType int // map: 1, reduce: 2, taskAllDone: 3
 	FName string
-	isDone bool
+	// intermediate data will be partitioned into NMap*NReduce files
+	// their file name are "mr-X-Y", x less than NMap and y less than NReudce
+	NMap int
+	NReduce int
 }
 
 // WorkerState表示worker的状态,应该当作RPC调用的参数,coordinator根据WorkerState来安排tasks
