@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -62,6 +63,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// NOTE: ask for a work from coordinator
 	oldTask := Task{}
 	newTask := &Task{}
+	wg := sync.WaitGroup{}
 
 	// for newTask.TaskType != TaskAllDone {
 	for true {
@@ -76,9 +78,17 @@ func Worker(mapf func(string, string) []KeyValue,
 		if newTask.TaskType == TaskAllDone || newTask.TaskType == 0 {
 			break
 		} else if newTask.TaskType == TaskMap {
-			workerMap(mapf, newTask)
+			wg.Add(1)
+			go func(newTask *Task) {
+				defer wg.Done()
+				workerMap(mapf, newTask)
+			}(newTask)
 		} else if newTask.TaskType == TaskReduce {
-			workerReduce(reducef, newTask)
+			wg.Add(1)
+			go func(newTask *Task) {
+				defer wg.Done()
+				workerReduce(reducef, newTask)
+			}(newTask)
 		} else if newTask.TaskType == 0 {
 			time.Sleep(time.Second)
 		}
@@ -87,7 +97,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
-
+	wg.Wait()
 }
 
 func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
@@ -181,6 +191,7 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
+		// TODO: use syncWriter to write atomically
 		fmt.Fprintf(mrOut, "%v %v\n", kva[i].Key, output)
 
 		i = j
