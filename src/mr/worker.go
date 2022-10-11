@@ -67,31 +67,18 @@ func Worker(mapf func(string, string) []KeyValue,
 	for true {
 		ok := call("Coordinator.Coordinate", oldTask, newTask)
 		if ok {
-			log.Printf("Handed in an old task: %v\n", oldTask)
-			log.Printf("Accepted a new task: %v\n", *newTask)
+			// log.Printf("Handed in an old task: %v\n", oldTask)
+			// log.Printf("Accepted a new task: %v\n", *newTask)
 		} else {
 			log.Printf("call failed!\n")
 		}
 
-		if newTask.TaskType == TaskAllDone {
+		if newTask.TaskType == TaskAllDone || newTask.TaskType == 0 {
 			break
 		} else if newTask.TaskType == TaskMap {
-			// NOTE: map
-			// sWriters := []*syncWriter{}
-			// for i := 0; i < newTask.NReduce; i++ {
-				// filename := fmt.Sprintf("mr-%d-%d", newTask.TaskNum, i)
-				// filename := fmt.Sprintf("mr-%d", newTask.TaskNum)
-				// file, err := os.Create(filename)
-				// if err != nil {
-				// 	log.Fatalf("Worker: %v", err)
-				// }
-				// sw := &syncWriter{sync.Mutex{}, file}
-				// sWriters = append(sWriters, sw)
-			// }
-			kvFileName := fmt.Sprintf("mr-%d-%d", newTask.TaskNum, 0)
-			workerMap(mapf, newTask.FName, kvFileName)
+			workerMap(mapf, newTask)
 		} else if newTask.TaskType == TaskReduce {
-
+			workerReduce(reducef, newTask)
 		} else if newTask.TaskType == 0 {
 			time.Sleep(time.Second)
 		}
@@ -103,60 +90,61 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
-// workerMap把filename和对应文件的内容传入mapf函数,并返回mapf函数运行的返回值
-// 这提供了一层封装,让workerMap只执行函数,但是不需要处理RPC
-func workerMap(mapf func(string, string) []KeyValue, filename string,
-	outputName string) error {
+func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	if mapf == nil {
 		// NOTE: []KeyValue可以为nil吗?
 		return fmt.Errorf("workerMap: mapf is nil!");
 	}
 	intermediate := []KeyValue{}
 
+	files := []*os.File{}
+	encs := []*json.Encoder{}
+	for i := 0; i < mTask.NReduce; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", mTask.TaskNum, i)
+		file, err := os.Create(filename)
+		defer file.Close()
+		if err != nil {
+			log.Printf("workerMap: %v, cannot create %v", err, filename)
+		}
+		files = append(files, file)
+		encs = append(encs, json.NewEncoder(file))
+	}
+
 	// read from input file
-	file, err := os.Open(filename)
+	file, err := os.Open(mTask.FName)
+	defer file.Close()
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		log.Fatalf("cannot open %v", mTask.FName)
 	}
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", filename)
+		log.Fatalf("cannot read %v", mTask.FName)
 	}
-	file.Close()
-	kva := mapf(filename, string(content))
+	kva := mapf(mTask.FName, string(content))
 	intermediate = append(intermediate, kva...)
 
 	// output to outputName file
-	// TODO: 把kva写入mr-X-Y, where X is the Map task number, and Y is the reduce task number.
-	// TODO: mr-%d-0
-	file, err = os.Create(outputName)
-	if err != nil {
-		log.Fatalf("cannot create %v", outputName)
-	}
-	enc := json.NewEncoder(file)
 	// for i := 0; i < len(intermediate); i++ {
 	for _, kv := range intermediate {
-		// TODO: 原子化写入
-		err := enc.Encode(&kv)
+		err := encs[ihash(kv.Key) % mTask.NReduce].Encode(&kv)
 		if err != nil {
 			log.Fatalf("enc.Encode\n")
 		}
-		// toWrite := fmt.Sprintf("%v %v\n", intermediate[i].Key, intermediate[i].Value)
-		// file.WriteString(toWrite)
 	}
-	file.Close()
 	return nil
 }
 
 func workerReduce(reducef func(string, []string) string, rTask *Task) {
 	// files := []*os.File{}
 	kva := []KeyValue{}
-	for i := 0; i < rTask.NReduce; i++ {
+	for i := 0; i < rTask.NMap; i++ {
 		// TODO mr-X-Y
-		file, err := os.Open(fmt.Sprintf("mr-%d-%d", rTask.TaskNum, i))
+		file, err := os.Open(fmt.Sprintf("mr-%d-%d", i, rTask.TaskNum))
+		// log.Printf("workerReduce: opened mr-%d-%d\n", rTask.TaskNum, i)
 		if err != nil {
 			log.Fatalf("workerReduce: %v", err)
 		}
+
 
 		dec := json.NewDecoder(file)
 		for {
@@ -236,8 +224,6 @@ func CallExample() {
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
-	// TODO: delete next line
-	// fmt.Println(sockname)
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)

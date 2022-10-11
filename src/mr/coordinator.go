@@ -56,8 +56,8 @@ type reduceTask struct {
 // oldTask, newTask
 func (c *Coordinator) Coordinate(oldTask Task, newTask *Task) error {
 	// TODO: 处理并发
-	log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
-	log.Printf("c.Coordinate: newTask: %v\n", newTask)
+	// log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
+	// log.Printf("c.Coordinate: newTask: %v\n", newTask)
 	// NOTE: 处理oldTask
 	c.coordinateOldTask(oldTask)
 	if c.mapDoneCount > len(c.mTasks) {
@@ -112,6 +112,7 @@ func (c *Coordinator) coordinateOldTask(oldTask Task)  {
 func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// log.Printf("coordinateNewTask: c.state %v", c.state)
 
 	if c.state == CoorMapping {
 		for i := 0; i < len(c.mTasks); i++ {
@@ -126,9 +127,9 @@ func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 			}
 		}
 	} else if c.state == CoorReducing {
-		for i := 0; i < len(c.mTasks); i++ {
-			if c.mTasks[i].state == TaskWating {
-				c.mTasks[i].state = TaskRunning
+		for i := 0; i < len(c.rTasks); i++ {
+			if c.rTasks[i].state == TaskWating {
+				c.rTasks[i].state = TaskRunning
 				newTask.TaskNum = i
 				newTask.TaskType = TaskReduce
 				newTask.FName = ""
@@ -198,7 +199,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for i := 0; i < nReduce; i++ {
 		c.rTasks = append(c.rTasks, reduceTask{i, TaskWating})
 	}
-	log.Printf("MakeCoordinator: %v\n", c)
+	// log.Printf("MakeCoordinator: %v\n", c)
 
 
 	c.server()
