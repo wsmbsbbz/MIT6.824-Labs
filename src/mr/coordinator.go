@@ -1,11 +1,14 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-import "sync"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
 const (
 	// Coordinator.state
@@ -44,11 +47,13 @@ type Coordinator struct {
 type mapTask struct {
 	fName string
 	state int
+	beginTime time.Time
 }
 
 type reduceTask struct {
 	taskNum int
 	state int
+	beginTime time.Time
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -56,24 +61,22 @@ type reduceTask struct {
 // oldTask, newTask
 func (c *Coordinator) Coordinate(oldTask Task, newTask *Task) error {
 	// TODO: 处理并发
-	// log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
+	log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
 	// log.Printf("c.Coordinate: newTask: %v\n", newTask)
 	// NOTE: 处理oldTask
 	c.coordinateOldTask(oldTask)
+	c.mu.Lock()
 	if c.mapDoneCount > len(c.mTasks) {
 		log.Printf("c.Coordinate: unvalid c.mapDoneCount %v with len(c.files) %v\n",
 			c.mapDoneCount, len(c.mTasks))
 	}
+	c.mu.Unlock()
 
 	// NOTE: 分配newTask
 	c.coordinateNewTask(newTask)
 
 	// TODO: 目前是分配一个FName,需要改为为每个worker分配一个不同的FName
 	return nil
-}
-
-func (c *Coordinator) coordinateFile()  {
-	
 }
 
 // coordinatorOldTask获取c.mu锁,并在返回时Unlock
@@ -103,7 +106,7 @@ func (c *Coordinator) coordinateOldTask(oldTask Task)  {
 			c.state = CoorAllDone
 		}
 	} else if oldTask.TaskType == TaskAllDone {
-		log.Printf("coordinateOldTask: TaskAllDone %v\n", oldTask.TaskType)
+		// log.Printf("coordinateOldTask: TaskAllDone %v\n", oldTask.TaskType)
 	} else {
 		log.Fatalf("coordinateOldTask: unvalid TaskType %v\n", oldTask.TaskType)
 	}
@@ -116,7 +119,10 @@ func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 
 	if c.state == CoorMapping {
 		for i := 0; i < len(c.mTasks); i++ {
-			if c.mTasks[i].state == TaskWating {
+			if c.mTasks[i].state == TaskWating || ( c.mTasks[i].state == TaskRunning && time.Since(c.mTasks[i].beginTime) >= time.Second * 10) {
+				if c.mTasks[i].state == TaskRunning && time.Since(c.mTasks[i].beginTime) >= time.Second * 10 {
+					log.Printf("time expired")
+				}
 				c.mTasks[i].state = TaskRunning
 				newTask.TaskNum = i
 				newTask.TaskType = TaskMap
@@ -128,7 +134,7 @@ func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 		}
 	} else if c.state == CoorReducing {
 		for i := 0; i < len(c.rTasks); i++ {
-			if c.rTasks[i].state == TaskWating {
+			if c.rTasks[i].state == TaskWating || ( c.rTasks[i].state == TaskRunning && time.Since(c.rTasks[i].beginTime) >= time.Second * 10) {
 				c.rTasks[i].state = TaskRunning
 				newTask.TaskNum = i
 				newTask.TaskType = TaskReduce
@@ -194,10 +200,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c := &Coordinator{state: CoorMapping, nMap: len(files), nReduce: nReduce}
 	for _, filename := range files{
-		c.mTasks = append(c.mTasks, mapTask{filename, TaskWating})
+		c.mTasks = append(c.mTasks, mapTask{filename, TaskWating, time.Now()})
 	}
 	for i := 0; i < nReduce; i++ {
-		c.rTasks = append(c.rTasks, reduceTask{i, TaskWating})
+		c.rTasks = append(c.rTasks, reduceTask{i, TaskWating, time.Now()})
 	}
 	// log.Printf("MakeCoordinator: %v\n", c)
 

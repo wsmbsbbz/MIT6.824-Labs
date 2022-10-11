@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/rpc"
@@ -21,16 +22,23 @@ type KeyValue struct {
 	Value string
 }
 
-// type syncWriter struct {
-// 	mu sync.Mutex
-// 	writer io.Writer
-// }
+type syncWriter struct {
+	mu sync.Mutex
+	writer io.Writer
+}
 
-// func (w *syncWriter) Write(p []byte) (n int, err error) {
-// 	w.mu.Lock()
-// 	defer w.mu.Unlock()
-// 	return w.Write(p)
-// }
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.writer.Write(p)
+	if err != nil {
+		log.Printf("*syncWriter.Write: %v\n", err)
+	}
+	// return w.Write(p)
+	return n, err
+}
+
+var syncWriterMap sync.Map
 
 // for sorting by key.
 type ByKey []KeyValue
@@ -50,7 +58,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -66,33 +73,22 @@ func Worker(mapf func(string, string) []KeyValue,
 	wg := sync.WaitGroup{}
 
 	// for newTask.TaskType != TaskAllDone {
-	for true {
-		ok := call("Coordinator.Coordinate", oldTask, newTask)
-		if ok {
-			// log.Printf("Handed in an old task: %v\n", oldTask)
-			// log.Printf("Accepted a new task: %v\n", *newTask)
-		} else {
-			log.Printf("call failed!\n")
-		}
-
-		if newTask.TaskType == TaskAllDone || newTask.TaskType == 0 {
-			break
-		} else if newTask.TaskType == TaskMap {
-			wg.Add(1)
-			go func(newTask *Task) {
-				defer wg.Done()
+	for call("Coordinator.Coordinate", oldTask, newTask) {
+		if newTask.TaskType == TaskMap {
+			// wg.Add(1)
+			// go func(newTask *Task) {
+			// 	defer wg.Done()
 				workerMap(mapf, newTask)
-			}(newTask)
+			// }(newTask)
 		} else if newTask.TaskType == TaskReduce {
 			wg.Add(1)
 			go func(newTask *Task) {
 				defer wg.Done()
 				workerReduce(reducef, newTask)
 			}(newTask)
-		} else if newTask.TaskType == 0 {
-			time.Sleep(time.Second)
 		}
 		oldTask, newTask = *newTask, &Task{}
+		time.Sleep(time.Second)
 	}
 
 	// uncomment to send the Example RPC to the coordinator.
@@ -107,16 +103,18 @@ func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	}
 	intermediate := []KeyValue{}
 
-	files := []*os.File{}
+	// key: tmpFilename, val: filename
+	files := map[string]string{}
 	encs := []*json.Encoder{}
 	for i := 0; i < mTask.NReduce; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", mTask.TaskNum, i)
-		file, err := os.Create(filename)
+		tmpFilename := "tmp-" + filename
+		file, err := os.Create(tmpFilename)
 		defer file.Close()
 		if err != nil {
 			log.Printf("workerMap: %v, cannot create %v", err, filename)
 		}
-		files = append(files, file)
+		files[tmpFilename] = filename
 		encs = append(encs, json.NewEncoder(file))
 	}
 
@@ -141,17 +139,21 @@ func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 			log.Fatalf("enc.Encode\n")
 		}
 	}
+	// atomically rename temp files to finished files
+	for tmpFilename, filename := range files {
+		os.Rename(tmpFilename, filename)
+	}
 	return nil
 }
 
 func workerReduce(reducef func(string, []string) string, rTask *Task) {
-	// files := []*os.File{}
 	kva := []KeyValue{}
 	for i := 0; i < rTask.NMap; i++ {
-		// TODO mr-X-Y
 		file, err := os.Open(fmt.Sprintf("mr-%d-%d", i, rTask.TaskNum))
 		// log.Printf("workerReduce: opened mr-%d-%d\n", rTask.TaskNum, i)
 		if err != nil {
+			// ERRO: in job count test: FAIL
+			// 2022/10/11 18:13:53 workerReduce: open mr-7-0: no such file or directory
 			log.Fatalf("workerReduce: %v", err)
 		}
 
@@ -173,11 +175,14 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 	// and print the result to mr-out-0.
 	//
 	i := 0
-	mrOut, err := os.Create(fmt.Sprintf("mr-out-%d", rTask.TaskNum))
-	defer mrOut.Close()
+	filename := fmt.Sprintf("mr-out-%d", rTask.TaskNum)
+	ofile, err := os.Create(filename)
+	defer ofile.Close()
 	if err != nil {
 		log.Printf("workerReduce: %v", err)
 	}
+	actual, _ := syncWriterMap.LoadOrStore(filename, &syncWriter{writer: ofile})
+	sw := actual.(*syncWriter)
 
 	for i < len(kva) {
 		j := i + 1
@@ -192,7 +197,7 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 
 		// this is the correct format for each line of Reduce output.
 		// TODO: use syncWriter to write atomically
-		fmt.Fprintf(mrOut, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(sw, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
@@ -237,7 +242,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return false
+		// log.Fatal("dialing:", err)
 	}
 	defer c.Close()
 
