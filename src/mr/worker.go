@@ -108,13 +108,13 @@ func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	encs := []*json.Encoder{}
 	for i := 0; i < mTask.NReduce; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", mTask.TaskNum, i)
-		tmpFilename := "tmp-" + filename
-		file, err := os.Create(tmpFilename)
+		// TODO: enable TempFile to workerReduce
+		file, err := ioutil.TempFile(".", "*")
 		defer file.Close()
 		if err != nil {
 			log.Printf("workerMap: %v, cannot create %v", err, filename)
 		}
-		files[tmpFilename] = filename
+		files[file.Name()] = filename
 		encs = append(encs, json.NewEncoder(file))
 	}
 
@@ -176,7 +176,8 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 	//
 	i := 0
 	filename := fmt.Sprintf("mr-out-%d", rTask.TaskNum)
-	ofile, err := os.Create(filename)
+	// ofile, err := os.Create(filename)
+	ofile, err := ioutil.TempFile(".", "*")
 	defer ofile.Close()
 	if err != nil {
 		log.Printf("workerReduce: %v", err)
@@ -201,6 +202,7 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 
 		i = j
 	}
+	os.Rename(ofile.Name(), filename)
 }
 
 //

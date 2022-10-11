@@ -94,14 +94,18 @@ func (c *Coordinator) coordinateOldTask(oldTask Task)  {
 	}
 
 	if oldTask.TaskType == TaskMap {
-		c.mTasks[oldTask.TaskNum].state = TaskDone
-		c.mapDoneCount++
+		if c.mTasks[oldTask.TaskNum].state != TaskDone {
+			c.mTasks[oldTask.TaskNum].state = TaskDone
+			c.mapDoneCount++
+		}
 		if c.mapDoneCount == len(c.mTasks) {
 			c.state = CoorReducing
 		}
 	} else if oldTask.TaskType == TaskReduce {
-		c.rTasks[oldTask.TaskNum].state = TaskDone
-		c.reduceDoneCount++
+		if c.rTasks[oldTask.TaskNum].state != TaskDone {
+			c.rTasks[oldTask.TaskNum].state = TaskDone
+			c.reduceDoneCount++
+		}
 		if c.reduceDoneCount == c.nReduce {
 			c.state = CoorAllDone
 		}
@@ -121,7 +125,7 @@ func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 		for i := 0; i < len(c.mTasks); i++ {
 			if c.mTasks[i].state == TaskWating || ( c.mTasks[i].state == TaskRunning && time.Since(c.mTasks[i].beginTime) >= time.Second * 10) {
 				if c.mTasks[i].state == TaskRunning && time.Since(c.mTasks[i].beginTime) >= time.Second * 10 {
-					log.Printf("time expired")
+					log.Printf("mTask time expired")
 				}
 				c.mTasks[i].state = TaskRunning
 				newTask.TaskNum = i
@@ -135,6 +139,9 @@ func (c *Coordinator) coordinateNewTask(newTask *Task)  {
 	} else if c.state == CoorReducing {
 		for i := 0; i < len(c.rTasks); i++ {
 			if c.rTasks[i].state == TaskWating || ( c.rTasks[i].state == TaskRunning && time.Since(c.rTasks[i].beginTime) >= time.Second * 10) {
+				if c.rTasks[i].state == TaskRunning && time.Since(c.rTasks[i].beginTime) >= time.Second * 10 {
+					log.Printf("rTask time expired")
+				}
 				c.rTasks[i].state = TaskRunning
 				newTask.TaskNum = i
 				newTask.TaskType = TaskReduce
