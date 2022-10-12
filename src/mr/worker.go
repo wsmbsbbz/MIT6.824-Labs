@@ -34,7 +34,6 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	if err != nil {
 		log.Printf("*syncWriter.Write: %v\n", err)
 	}
-	// return w.Write(p)
 	return n, err
 }
 
@@ -67,25 +66,17 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	// NOTE: ask for a work from coordinator
 	oldTask := Task{}
 	newTask := &Task{}
 	wg := sync.WaitGroup{}
 
-	// for newTask.TaskType != TaskAllDone {
 	for call("Coordinator.Coordinate", oldTask, newTask) {
+		// WARR: run workerMap and workerReduce currently will cause map
+		// parallelism and reduce parallelism tests FAIL
 		if newTask.TaskType == TaskMap {
-			// wg.Add(1)
-			// go func(newTask *Task) {
-			// 	defer wg.Done()
 				workerMap(mapf, newTask)
-			// }(newTask)
 		} else if newTask.TaskType == TaskReduce {
-			wg.Add(1)
-			go func(newTask *Task) {
-				defer wg.Done()
 				workerReduce(reducef, newTask)
-			}(newTask)
 		}
 		oldTask, newTask = *newTask, &Task{}
 		time.Sleep(time.Second)
@@ -98,7 +89,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	if mapf == nil {
-		// NOTE: []KeyValue可以为nil吗?
+		// NOTE: can []KeyValue be nil?
 		return fmt.Errorf("workerMap: mapf is nil!");
 	}
 	intermediate := []KeyValue{}
@@ -108,8 +99,7 @@ func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	encs := []*json.Encoder{}
 	for i := 0; i < mTask.NReduce; i++ {
 		filename := fmt.Sprintf("mr-%d-%d", mTask.TaskNum, i)
-		// TODO: enable TempFile to workerReduce
-		file, err := ioutil.TempFile(".", "*")
+		file, err := ioutil.TempFile(".", "mr-tmpm-")
 		defer file.Close()
 		if err != nil {
 			log.Printf("workerMap: %v, cannot create %v", err, filename)
@@ -132,7 +122,6 @@ func workerMap(mapf func(string, string) []KeyValue, mTask *Task) error {
 	intermediate = append(intermediate, kva...)
 
 	// output to outputName file
-	// for i := 0; i < len(intermediate); i++ {
 	for _, kv := range intermediate {
 		err := encs[ihash(kv.Key) % mTask.NReduce].Encode(&kv)
 		if err != nil {
@@ -150,13 +139,9 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 	kva := []KeyValue{}
 	for i := 0; i < rTask.NMap; i++ {
 		file, err := os.Open(fmt.Sprintf("mr-%d-%d", i, rTask.TaskNum))
-		// log.Printf("workerReduce: opened mr-%d-%d\n", rTask.TaskNum, i)
 		if err != nil {
-			// ERRO: in job count test: FAIL
-			// 2022/10/11 18:13:53 workerReduce: open mr-7-0: no such file or directory
 			log.Fatalf("workerReduce: %v", err)
 		}
-
 
 		dec := json.NewDecoder(file)
 		for {
@@ -176,8 +161,7 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 	//
 	i := 0
 	filename := fmt.Sprintf("mr-out-%d", rTask.TaskNum)
-	// ofile, err := os.Create(filename)
-	ofile, err := ioutil.TempFile(".", "*")
+	ofile, err := ioutil.TempFile(".", "mr-tmpr-")
 	defer ofile.Close()
 	if err != nil {
 		log.Printf("workerReduce: %v", err)
@@ -197,7 +181,6 @@ func workerReduce(reducef func(string, []string) string, rTask *Task) {
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		// TODO: use syncWriter to write atomically
 		fmt.Fprintf(sw, "%v %v\n", kva[i].Key, output)
 
 		i = j

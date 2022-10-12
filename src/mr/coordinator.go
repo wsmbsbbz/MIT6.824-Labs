@@ -30,14 +30,13 @@ const (
 
 type Coordinator struct {
 	// Your definitions here.
-	// NOTE: 处理多个文件
 	mu sync.Mutex
 	state int // mapping: 1, reducing: 2, allDone: 3
 
 	nMap int
 	mTasks []mapTask
 	mapDoneCount int
-	// NOTE: 拆分为nReduce个reduce文件
+
 	nReduce int
 	rTasks []reduceTask
 	reduceDoneCount int
@@ -60,10 +59,8 @@ type reduceTask struct {
 // args可以是一个表示worker的状态,
 // oldTask, newTask
 func (c *Coordinator) Coordinate(oldTask Task, newTask *Task) error {
-	// TODO: 处理并发
 	log.Printf("c.Coordinate: oldTask: %v\n", oldTask)
 	// log.Printf("c.Coordinate: newTask: %v\n", newTask)
-	// NOTE: 处理oldTask
 	c.coordinateOldTask(oldTask)
 	c.mu.Lock()
 	if c.mapDoneCount > len(c.mTasks) {
@@ -79,7 +76,6 @@ func (c *Coordinator) Coordinate(oldTask Task, newTask *Task) error {
 	return nil
 }
 
-// coordinatorOldTask获取c.mu锁,并在返回时Unlock
 func (c *Coordinator) coordinateOldTask(oldTask Task)  {
 	// 无oldTask,不处理,说明这个worker是第一次申请task
 	if oldTask.TaskType == 0 {
