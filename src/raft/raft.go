@@ -532,6 +532,7 @@ func (rf *Raft) String() string {
 
 const DebugOpen = false
 func Debugf(format string, v ...interface{}) {
+	log.SetFlags(log.Lmicroseconds)
 	if !DebugOpen {
 		return
 	}
