@@ -19,13 +19,17 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
+	"math/rand"
+
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +54,24 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	// Raft.state
+	Leader = 1
+	// Candidate = 2
+	Follower = 3
+	// timeout
+	MinTick = 200 * time.Millisecond
+	TickInterval = 300 * time.Millisecond
+	HeartbeatInterval = 100 * time.Millisecond
+)
+
+type logEntry struct {
+	// NOTE: first index is 1
+	Index int
+	Term int
+	// TODO: command
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -64,16 +86,46 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent state on all servers:
+	currentTerm int
+	// 在当前term未投票时,votedFor = -1
+	votedFor int
+	// NOTE: temporary
+	log []logEntry
+	// volatile state on all servers:
+	commitIndex int
+	lastApplied int
+	// volatile state on leaders:
+	nextIndex []int
+	matchIndex []int
+
+	// for leader election:
+	state int // leader, candidate, follower
+	votes int
+
+	// heartbeatInterval time.Ticker
+	// NOTE: 每次收到AppendEntries RPC,会重置timeout
+	aerCh chan struct{}
+}
+
+func randomDuration() time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	ret := MinTick + time.Duration(rand.Intn(int(TickInterval)))
+	// Debugf("randomDuration: ret: %v\n", ret)
+	return ret
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
+	// var term int
+	// var isleader bool
+	// return term, isleader
 	// Your code here (2A).
-	return term, isleader
+	// WARR: 需要lock吗?
+	Debugf("GetState: %v\n", rf)
+	return rf.currentTerm, rf.state == Leader
 }
 
 //
@@ -143,6 +195,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	// 所有CandidateId应该大于0
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -151,6 +208,22 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []logEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
 }
 
 //
@@ -158,6 +231,27 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debugf("RequestVote-Start: %v\n", rf)
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+	} else if args.Term > rf.currentTerm {
+		// NOTE: 接受任何RPC请求时,发现currentTerm < args.Term,需要更新currentTerm并转换为follower
+		rf.coverTerm(args.Term)
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else {
+		if rf.votedFor < 0 {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+		} else {
+			reply.VoteGranted = false
+		}
+	}
+	reply.Term = rf.currentTerm
+	Debugf("RequestVote-End: %v\n", rf)
+	// TODO: 检查args.LastLogIndex和args.LastLogTerm是否符合paper中的要求
 }
 
 //
@@ -194,6 +288,35 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// rf.mu.Lock()
+	// t := rf.currentTerm
+	// rf.mu.Unlock()
+	// heartbeat
+	// WARR: 此时有race
+	go func() {
+		rf.aerCh <- struct{}{}
+	}()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debugf("AppendEntries-Start: %v", rf)
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else if args.Term > rf.currentTerm {
+		rf.coverTerm(args.Term)
+		reply.Success = true
+	} else {
+		reply.Success = true
+	}
+	reply.Term = rf.currentTerm
+	Debugf("AppendEntries-End: %v", rf)
+	// TODO: Receiver implementation 2-5
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -244,13 +367,127 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	rand.Seed(time.Now().Unix())
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
+		if rf.state == Leader {
+			Debugf("%v is leader\n", rf.me)
+			// NOTE: 每隔heartbeatInterval,就发起一轮heartbeat
+			args := &AppendEntriesArgs{
+				Term: rf.currentTerm,
+				LeaderId: rf.me,
+				// PrevLogIndex: ,
+				// PrevLogTerm: ,
+				// Entries: ,
+				// LeaderCommit: ,
+			}
+			for i := range rf.peers {
+				reply := &AppendEntriesReply{}
+				go func(i int) {
+					rf.sendAppendEntries(i, args, reply)
+					// TODO: 处理log
+					if reply.Term > rf.currentTerm {
+						rf.coverTerm(reply.Term)
+					}
+				}(i)
+			}
+			time.Sleep(HeartbeatInterval)
+		} else {
+			timeout := make(chan struct{})
+			go func() {
+				time.Sleep(randomDuration())
+				timeout <- struct{}{}
+			}()
+			select {
+			case <-timeout:
+				// 开始竞选
+				rf.HoldElection()
+			case <-rf.aerCh:
+				// TODO: 检查是否收到AppendEntries请求
+				Debugf("ticker %v: case <- rf.aerCh\n", rf.me)
+				time.Sleep(randomDuration())
+			}
+			Debugf("ticker %v: rf.state: %v\n", rf.me, rf.state)
+		}
 	}
+}
+
+func (rf *Raft) HoldElection()  {
+	// NOTE: 清空aerCh
+	// select {
+	// case <- rf.aerCh:
+	// default:
+	// }
+	rf.mu.Lock()
+	Debugf("before hold: %v\n", rf)
+	Debugf("HoldElection-Start: %v\n", rf)
+	win := make(chan struct{})
+	rf.currentTerm += 1
+	// rf.state = Candidate
+	// 自己投自己1票,随后会向自身发送RequestVote RPC请求,但因为votedFor已经>=0,不会再加投自己
+	rf.votes = 1
+	rf.votedFor = rf.me
+	args := &RequestVoteArgs{
+		Term: rf.currentTerm,
+		CandidateId: rf.me,
+		// LastLogIndex: rf.log[len(rf.log)-1].index,
+		// LastLogTerm: rf.log[len(rf.log)-1].term,
+	}
+	for i := range rf.peers {
+		reply := &RequestVoteReply{}
+		go func(i int, reply *RequestVoteReply) {
+			rf.sendRequestVote(i, args, reply)
+			// rf.mu.Lock()
+			// defer rf.mu.Unlock()
+			Debugf("HoldElection: me:%v currentTerm:%v reply: %v\n", rf.me, rf.currentTerm, reply)
+			if reply.Term > rf.currentTerm {
+				rf.coverTerm(reply.Term)
+			} else {
+				if reply.VoteGranted {
+					rf.votes += 1
+				}
+				if rf.votes > len(rf.peers) / 2{
+					win <- struct{}{}
+				}
+			}
+			// ERRO: 未Unlock之前,外部的HoldElection函数返回了,所以这个lock永远锁住了
+			// rf.mu.Unlock()
+			Debugf("Hold-Unlock: %v\n", rf)
+		}(i, reply)
+	}
+	timeout := make(chan struct{})
+	go func() {
+		time.Sleep(randomDuration())
+		timeout <- struct{}{}
+	}()
+
+	rf.mu.Unlock()
+	select {
+	case <- win:
+		rf.mu.Lock()
+		Debugf("HoldElection-Win: %v\n", rf)
+		// 接任成为新leader
+		rf.state = Leader
+		rf.mu.Unlock()
+	case <-timeout:
+		Debugf("HoldElection-Fail: %v\n", rf)
+		rf.mu.Lock()
+		// 竞选失败,恢复Follower
+		rf.state = Follower
+		rf.mu.Unlock()
+	// TODO: case heartbeat
+	case <-rf.aerCh:
+		// ERRO: 这部分永远不会运行,why?
+		Debugf("HoldElection-Heartbeat: %v\n", rf)
+		rf.mu.Lock()
+		rf.state = Follower
+		rf.mu.Unlock()
+	}
+	Debugf("HoldElection-End: %v\n", rf)
 }
 
 //
@@ -272,6 +509,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
+	rf.currentTerm = 1
+	rf.votedFor = -1
+	Debugf("Make: rf.state: %v\n", rf.state)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -281,4 +522,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	return rf
+}
+
+func (rf *Raft) String() string {
+	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes)
+}
+
+const DebugOpen = false
+func Debugf(format string, v ...interface{}) {
+	if !DebugOpen {
+		return
+	}
+	log.Printf(format, v...)
+}
+
+func (rf *Raft) coverTerm(term int) {
+	// NOTE: 只有在rf.mu持有时,才能调用此method
+	if rf.currentTerm >= term {
+		log.Fatalln("rf.currentTerm >= term")
+	}
+	Debugf("coverTerm: %v, newTerm: %v", rf, term)
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = -1
+	rf.votes = 0
 }
