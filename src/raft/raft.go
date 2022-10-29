@@ -105,7 +105,7 @@ type Raft struct {
 
 	// heartbeatInterval time.Ticker
 	// NOTE: 每次收到AppendEntries RPC,会重置timeout
-	aerCh chan struct{}
+	heartbeat <- chan time.Time
 }
 
 func randomDuration() time.Duration {
@@ -289,13 +289,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// rf.mu.Lock()
-	// t := rf.currentTerm
-	// rf.mu.Unlock()
 	// heartbeat
 	// WARR: 此时有race
 	go func() {
-		rf.aerCh <- struct{}{}
+		Debugf("Chan waiting\n")
+		rf.heartbeat = time.After(HeartbeatInterval)
+		Debugf("Chan emitted\n")
 	}()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -391,7 +390,9 @@ func (rf *Raft) ticker() {
 					rf.sendAppendEntries(i, args, reply)
 					// TODO: 处理log
 					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
 						rf.coverTerm(reply.Term)
+						rf.mu.Unlock()
 					}
 				}(i)
 			}
@@ -403,13 +404,13 @@ func (rf *Raft) ticker() {
 				timeout <- struct{}{}
 			}()
 			select {
-			case <-timeout:
-				// 开始竞选
-				rf.HoldElection()
-			case <-rf.aerCh:
+			case <-rf.heartbeat:
 				// TODO: 检查是否收到AppendEntries请求
 				Debugf("ticker %v: case <- rf.aerCh\n", rf.me)
 				time.Sleep(randomDuration())
+			case <-timeout:
+				// 开始竞选
+				rf.HoldElection()
 			}
 			Debugf("ticker %v: rf.state: %v\n", rf.me, rf.state)
 		}
@@ -467,6 +468,12 @@ func (rf *Raft) HoldElection()  {
 
 	rf.mu.Unlock()
 	select {
+	case <-rf.heartbeat:
+		// ERRO: 这部分永远不会运行,why?
+		Debugf("HoldElection-Heartbeat: %v\n", rf)
+		rf.mu.Lock()
+		rf.state = Follower
+		rf.mu.Unlock()
 	case <- win:
 		rf.mu.Lock()
 		Debugf("HoldElection-Win: %v\n", rf)
@@ -480,12 +487,6 @@ func (rf *Raft) HoldElection()  {
 		rf.state = Follower
 		rf.mu.Unlock()
 	// TODO: case heartbeat
-	case <-rf.aerCh:
-		// ERRO: 这部分永远不会运行,why?
-		Debugf("HoldElection-Heartbeat: %v\n", rf)
-		rf.mu.Lock()
-		rf.state = Follower
-		rf.mu.Unlock()
 	}
 	Debugf("HoldElection-End: %v\n", rf)
 }
@@ -510,7 +511,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
-	rf.currentTerm = 1
+	rf.currentTerm = 0
 	rf.votedFor = -1
 	Debugf("Make: rf.state: %v\n", rf.state)
 
