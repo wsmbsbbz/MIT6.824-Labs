@@ -114,7 +114,6 @@ func (rf *Raft) GetState() (int, bool) {
 	// var isleader bool
 	// return term, isleader
 	// Your code here (2A).
-	// WARR: 需要lock吗?
 	rf.mu.Lock()
 	term, isLeader := rf.currentTerm, rf.state == Leader
 	Debugf("GetState: %v\n", rf)
@@ -303,6 +302,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.coverTerm(args.Term)
 	}
 	reply.Success = true
+	rf.tickerReset()
 	// TODO: Receiver implementation 2-5
 }
 
@@ -368,7 +368,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		if rf.state == Follower || rf.state == Candidate {
 			if time.Now().After(rf.election) {
-				Debugf("electionRunner: election expires\n")
+				Debugf("ticker: election expires\n")
 				// TODO: 开始新一轮选举
 				rf.holdElection()
 			}
@@ -385,8 +385,8 @@ func (rf *Raft) beater() {
 		if rf.state == Leader {
 			// NOTE: 每当rf.heartbeat到期后,就发起一轮heartbeat
 			if time.Now().After(rf.heartbeat) {
-				rf.heartbeatReset()
-				Debugf("heartbeatRunner: heartbeat expires\n")
+				rf.beaterReset()
+				Debugf("beater: heartbeat expires\n")
 				args := &AppendEntriesArgs{
 					Term: rf.currentTerm,
 					LeaderId: rf.me,
@@ -418,7 +418,7 @@ func (rf *Raft) beater() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) holdElection()  {
 	Debugf("holdElection-Start: %v\n", rf)
-	rf.electionReset()
+	rf.tickerReset()
 	rf.state = Candidate
 	rf.currentTerm += 1
 	// 自己投自己1票,随后会向自身发送RequestVote RPC请求,但因为votedFor已经>=0,不会再加投自己
@@ -457,12 +457,12 @@ func (rf *Raft) holdElection()  {
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
-func (rf *Raft) heartbeatReset() {
+func (rf *Raft) beaterReset() {
 	rf.heartbeat = time.Now().Add(HeartbeatInterval)
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
-func (rf *Raft) electionReset() {
+func (rf *Raft) tickerReset() {
 	rand.Seed(time.Now().UnixNano())
 	d := MinTick + time.Duration(rand.Intn(int(TickInterval)))
 	rf.election = time.Now().Add(MinTick + d)
