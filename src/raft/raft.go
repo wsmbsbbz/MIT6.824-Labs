@@ -57,12 +57,13 @@ type ApplyMsg struct {
 const (
 	// Raft.state
 	Leader = 1
-	// Candidate = 2
+	Candidate = 2
 	Follower = 3
 	// timeout
 	MinTick = 200 * time.Millisecond
 	TickInterval = 300 * time.Millisecond
 	HeartbeatInterval = 100 * time.Millisecond
+	timerLoop = 20 * time.Millisecond
 )
 
 type logEntry struct {
@@ -88,10 +89,8 @@ type Raft struct {
 
 	// persistent state on all servers:
 	currentTerm int
-	// 在当前term未投票时,votedFor = -1
-	votedFor int
-	// NOTE: temporary
-	log []logEntry
+	votedFor int // 在当前term未投票时,votedFor = -1
+	log []logEntry // NOTE: temporary
 	// volatile state on all servers:
 	commitIndex int
 	lastApplied int
@@ -103,16 +102,8 @@ type Raft struct {
 	state int // leader, candidate, follower
 	votes int
 
-	// heartbeatInterval time.Ticker
-	// NOTE: 每次收到AppendEntries RPC,会重置timeout
-	heartbeat <- chan time.Time
-}
-
-func randomDuration() time.Duration {
-	rand.Seed(time.Now().UnixNano())
-	ret := MinTick + time.Duration(rand.Intn(int(TickInterval)))
-	// Debugf("randomDuration: ret: %v\n", ret)
-	return ret
+	heartbeat time.Time
+	election time.Time // NOTE: 每次收到AppendEntries RPC,会重置election
 }
 
 // return currentTerm and whether this server
@@ -124,8 +115,11 @@ func (rf *Raft) GetState() (int, bool) {
 	// return term, isleader
 	// Your code here (2A).
 	// WARR: 需要lock吗?
+	rf.mu.Lock()
+	term, isLeader := rf.currentTerm, rf.state == Leader
 	Debugf("GetState: %v\n", rf)
-	return rf.currentTerm, rf.state == Leader
+	rf.mu.Unlock()
+	return term, isLeader
 }
 
 //
@@ -231,26 +225,28 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// NOTE: 默认投反对票
+	reply.VoteGranted = false
+
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		reply.Term = rf.currentTerm
+		Debugf("RequestVote-End: %v\n", rf)
+		rf.mu.Unlock()
+	}()
+
 	Debugf("RequestVote-Start: %v\n", rf)
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm {
+		return
+	}
+	if args.Term > rf.currentTerm {
 		// NOTE: 接受任何RPC请求时,发现currentTerm < args.Term,需要更新currentTerm并转换为follower
 		rf.coverTerm(args.Term)
+	}
+	if rf.votedFor < 0 {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-	} else {
-		if rf.votedFor < 0 {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
-		} else {
-			reply.VoteGranted = false
-		}
 	}
-	reply.Term = rf.currentTerm
-	Debugf("RequestVote-End: %v\n", rf)
 	// TODO: 检查args.LastLogIndex和args.LastLogTerm是否符合paper中的要求
 }
 
@@ -289,26 +285,24 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// heartbeat
-	// WARR: 此时有race
-	go func() {
-		Debugf("Chan waiting\n")
-		rf.heartbeat = time.After(HeartbeatInterval)
-		Debugf("Chan emitted\n")
-	}()
+	// NOTE: 默认拒绝AppendEntries
+	reply.Success = false
+
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	defer func() {
+		reply.Term = rf.currentTerm
+		Debugf("AppendEntries-End: %v", rf)
+		rf.mu.Unlock()
+	}()
+
 	Debugf("AppendEntries-Start: %v", rf)
 	if args.Term < rf.currentTerm {
-		reply.Success = false
-	} else if args.Term > rf.currentTerm {
+		return
+	} 
+	if args.Term > rf.currentTerm {
 		rf.coverTerm(args.Term)
-		reply.Success = true
-	} else {
-		reply.Success = true
 	}
-	reply.Term = rf.currentTerm
-	Debugf("AppendEntries-End: %v", rf)
+	reply.Success = true
 	// TODO: Receiver implementation 2-5
 }
 
@@ -366,69 +360,67 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	rand.Seed(time.Now().Unix())
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
-		if rf.state == Leader {
-			Debugf("%v is leader\n", rf.me)
-			// NOTE: 每隔heartbeatInterval,就发起一轮heartbeat
-			args := &AppendEntriesArgs{
-				Term: rf.currentTerm,
-				LeaderId: rf.me,
-				// PrevLogIndex: ,
-				// PrevLogTerm: ,
-				// Entries: ,
-				// LeaderCommit: ,
+		rf.mu.Lock()
+		if rf.state == Follower || rf.state == Candidate {
+			if time.Now().After(rf.election) {
+				Debugf("electionRunner: election expires\n")
+				// TODO: 开始新一轮选举
+				rf.holdElection()
 			}
-			for i := range rf.peers {
-				reply := &AppendEntriesReply{}
-				go func(i int) {
-					rf.sendAppendEntries(i, args, reply)
-					// TODO: 处理log
-					if reply.Term > rf.currentTerm {
-						rf.mu.Lock()
-						rf.coverTerm(reply.Term)
-						rf.mu.Unlock()
-					}
-				}(i)
-			}
-			time.Sleep(HeartbeatInterval)
-		} else {
-			timeout := make(chan struct{})
-			go func() {
-				time.Sleep(randomDuration())
-				timeout <- struct{}{}
-			}()
-			select {
-			case <-rf.heartbeat:
-				// TODO: 检查是否收到AppendEntries请求
-				Debugf("ticker %v: case <- rf.aerCh\n", rf.me)
-				time.Sleep(randomDuration())
-			case <-timeout:
-				// 开始竞选
-				rf.HoldElection()
-			}
-			Debugf("ticker %v: rf.state: %v\n", rf.me, rf.state)
 		}
+		rf.mu.Unlock()
+		time.Sleep(timerLoop)
 	}
 }
 
-func (rf *Raft) HoldElection()  {
-	// NOTE: 清空aerCh
-	// select {
-	// case <- rf.aerCh:
-	// default:
-	// }
-	rf.mu.Lock()
-	Debugf("before hold: %v\n", rf)
-	Debugf("HoldElection-Start: %v\n", rf)
-	win := make(chan struct{})
+// NOTE: protocol: 此方法应该在一个goroutine中独立运行
+func (rf *Raft) beater() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.state == Leader {
+			// NOTE: 每当rf.heartbeat到期后,就发起一轮heartbeat
+			if time.Now().After(rf.heartbeat) {
+				rf.heartbeatReset()
+				Debugf("heartbeatRunner: heartbeat expires\n")
+				args := &AppendEntriesArgs{
+					Term: rf.currentTerm,
+					LeaderId: rf.me,
+					// PrevLogIndex: ,
+					// PrevLogTerm: ,
+					// Entries: ,
+					// LeaderCommit: ,
+				}
+				for i := range rf.peers {
+					reply := &AppendEntriesReply{}
+					go func(i int) {
+						rf.sendAppendEntries(i, args, reply)
+						// TODO: 处理log
+						rf.mu.Lock()
+						if reply.Term > rf.currentTerm {
+							rf.coverTerm(reply.Term)
+						}
+						// NOTE: 收到reply时,当前server可能已经退位了,需要处理这种情况
+						rf.mu.Unlock()
+					}(i)
+				}
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(timerLoop)
+	}
+}
+
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+func (rf *Raft) holdElection()  {
+	Debugf("holdElection-Start: %v\n", rf)
+	rf.electionReset()
+	rf.state = Candidate
 	rf.currentTerm += 1
-	// rf.state = Candidate
 	// 自己投自己1票,随后会向自身发送RequestVote RPC请求,但因为votedFor已经>=0,不会再加投自己
 	rf.votes = 1
 	rf.votedFor = rf.me
@@ -442,53 +434,38 @@ func (rf *Raft) HoldElection()  {
 		reply := &RequestVoteReply{}
 		go func(i int, reply *RequestVoteReply) {
 			rf.sendRequestVote(i, args, reply)
-			// rf.mu.Lock()
-			// defer rf.mu.Unlock()
-			Debugf("HoldElection: me:%v currentTerm:%v reply: %v\n", rf.me, rf.currentTerm, reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			Debugf("RequestVoteReply: me:%v reply: %v\n", rf.me, reply)
 			if reply.Term > rf.currentTerm {
 				rf.coverTerm(reply.Term)
-			} else {
-				if reply.VoteGranted {
-					rf.votes += 1
-				}
-				if rf.votes > len(rf.peers) / 2{
-					win <- struct{}{}
-				}
+				return
 			}
-			// ERRO: 未Unlock之前,外部的HoldElection函数返回了,所以这个lock永远锁住了
-			// rf.mu.Unlock()
-			Debugf("Hold-Unlock: %v\n", rf)
+			if rf.state == Leader {
+				return
+			}
+			if reply.VoteGranted {
+				rf.votes += 1
+			}
+			if rf.votes > len(rf.peers) / 2 {
+				// TODO: 赢得选举,转化成leader
+				rf.state = Leader
+			}
 		}(i, reply)
 	}
-	timeout := make(chan struct{})
-	go func() {
-		time.Sleep(randomDuration())
-		timeout <- struct{}{}
-	}()
+	Debugf("holdElection-End: %v\n", rf)
+}
 
-	rf.mu.Unlock()
-	select {
-	case <-rf.heartbeat:
-		// ERRO: 这部分永远不会运行,why?
-		Debugf("HoldElection-Heartbeat: %v\n", rf)
-		rf.mu.Lock()
-		rf.state = Follower
-		rf.mu.Unlock()
-	case <- win:
-		rf.mu.Lock()
-		Debugf("HoldElection-Win: %v\n", rf)
-		// 接任成为新leader
-		rf.state = Leader
-		rf.mu.Unlock()
-	case <-timeout:
-		Debugf("HoldElection-Fail: %v\n", rf)
-		rf.mu.Lock()
-		// 竞选失败,恢复Follower
-		rf.state = Follower
-		rf.mu.Unlock()
-	// TODO: case heartbeat
-	}
-	Debugf("HoldElection-End: %v\n", rf)
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+func (rf *Raft) heartbeatReset() {
+	rf.heartbeat = time.Now().Add(HeartbeatInterval)
+}
+
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+func (rf *Raft) electionReset() {
+	rand.Seed(time.Now().UnixNano())
+	d := MinTick + time.Duration(rand.Intn(int(TickInterval)))
+	rf.election = time.Now().Add(MinTick + d)
 }
 
 //
@@ -513,18 +490,33 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	Debugf("Make: rf.state: %v\n", rf.state)
+	// rf.mu.Lock()
+	// Debugf("Make: rf.state: %v\n", rf.state)
+	// rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+	go rf.beater()
 
 	return rf
 }
 
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+func (rf *Raft) coverTerm(term int) {
+	if rf.currentTerm >= term {
+		log.Fatalln("rf.currentTerm >= term")
+	}
+	Debugf("coverTerm: %v, newTerm: %v", rf, term)
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = -1
+	rf.votes = 0
+}
+
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) String() string {
 	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v",
 		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes)
@@ -537,16 +529,4 @@ func Debugf(format string, v ...interface{}) {
 		return
 	}
 	log.Printf(format, v...)
-}
-
-func (rf *Raft) coverTerm(term int) {
-	// NOTE: 只有在rf.mu持有时,才能调用此method
-	if rf.currentTerm >= term {
-		log.Fatalln("rf.currentTerm >= term")
-	}
-	Debugf("coverTerm: %v, newTerm: %v", rf, term)
-	rf.currentTerm = term
-	rf.state = Follower
-	rf.votedFor = -1
-	rf.votes = 0
 }
