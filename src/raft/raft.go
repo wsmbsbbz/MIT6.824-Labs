@@ -444,7 +444,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					cond.Broadcast()
 					// rf.nextIndex[i] += len(args.Entries)
 					// rf.matchIndex[i] = rf.nextIndex[i] - 1
-					rf.matchIndex[i] += len(args.Entries)
+					// rf.matchIndex[i] += len(args.Entries)
+					rf.matchIndex[i] = min(rf.matchIndex[i] + len(args.Entries), len(rf.log) - 1)
 					Debugf("leader.nextIndex: %v\n", rf.nextIndex)
 					Debugf("leader.matchIndex: %v\n", rf.matchIndex)
 					rf.mu.Unlock()
@@ -461,21 +462,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}(i)
 	}
 
-	for successCnt <= len(rf.peers) / 2 {
-		Debugf("Start: waiting for exit cond-loop\n")
-		cond.Wait()
-	}
 	index, term, isLeader = len(rf.log) - 1, rf.currentTerm, true
-	applyMsg := ApplyMsg {
-		CommandValid: true,
-		Command: command,
-		CommandIndex: index,
-	}
-	rf.commitIndex = index
-	Debugf("Start: before send applyMsg: %v\n", applyMsg)
-	rf.applyCh <- applyMsg
-	Debugf("Start: applyMsg accepted\n")
-	rf.mu.Unlock()
+	go func() {
+		for successCnt <= len(rf.peers) / 2 {
+			Debugf("Start: waiting for exit cond-loop\n")
+			cond.Wait()
+		}
+		rf.commitIndex++
+		applyMsg := ApplyMsg {
+			CommandValid: true,
+			Command: rf.log[rf.commitIndex].Command,
+			CommandIndex: rf.commitIndex,
+		}
+		Debugf("Start: before send applyMsg: %v\n", applyMsg)
+		rf.applyCh <- applyMsg
+		Debugf("Start: applyMsg accepted\n")
+		rf.mu.Unlock()
+	}()
 
 	Debugf("Start: return\n")
 	return index, term, isLeader
@@ -691,24 +694,24 @@ func min(a, b int) int {
 	return b
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) String() string {
 	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v, commitIndex: %v, log: %v, nextIndex: %v, matchIndex :%v",
 		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes, rf.commitIndex, rf.log, rf.nextIndex, rf.matchIndex)
 }
 
-const DebugOpen = true
+const DebugOpen = false
 func Debugf(format string, v ...interface{}) {
 	log.SetFlags(log.Lmicroseconds)
 	if !DebugOpen {
 		return
 	}
 	log.Printf(format, v...)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
