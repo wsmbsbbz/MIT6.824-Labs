@@ -95,7 +95,6 @@ type Raft struct {
 	secureCommit int
 	lastApplied  int
 	// volatile state on leaders:
-	nextIndex  []int
 	matchIndex []int
 
 	// for leader election:
@@ -287,13 +286,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-// WARR: 即时是leader,也应该服从上面的那个规则,所以leader代码写到下面
-//
-//	if rf.state == Leader {
-//		Debugf("AppendEntries: rf.state is Leader, just reply\n")
-//		reply.Success = args.LeaderId == rf.me
-//		return
-//	}
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	Debugf("AppendEntries-Start: Raft: %v#, args: %v\n", rf, args)
@@ -304,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 
 	// Rules for All Servers:
-	// 1. TODO: if commitIndex > lastApplied, increment lastApplied and apply it
+	// NOTE: rule 1 has been implemented in committer
 	// 2. if args.Term > rf.currentTerm, convert to follower
 	if args.Term > rf.currentTerm {
 		rf.coverTerm(args.Term)
@@ -335,29 +327,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 4. Append any new entries not already in the log
 	Debugf("AppendEntries: rf.log: %v#, args.Entries[%v:]: %v\n", rf.log, i, args.Entries[i:])
 	rf.log = append(rf.log, args.Entries[i:]...)
-	// if args.LeaderCommit > len(rf.log) {
-	// 	fmt.Printf("rf.log: %v, args: %v\n", rf.log, args)
-	// }
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(
 	// leaderCommit, index of last new entry)
 	rf.secureCommit = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
-	// for min(args.LeaderCommit, rf.log[len(rf.log)-1].Index) > rf.commitIndex {
-	// 	// WARR: 因为leader保证发过来的log绝对能包含LeaderCommit的index的log,所以不需要
-	// 	// 使用min()函数吗?
-	// 	// rf.commitIndex = min(args.LeaderCommit, len(rf.log) - 1)
-	// 	rf.commitIndex++
-	// 	applyMsg := ApplyMsg {
-	// 		CommandValid: true,
-	// 		Command: rf.log[rf.commitIndex].Command,
-	// 		CommandIndex: rf.commitIndex,
-	// 	}
-	//        // TODO: 写入硬盘log
-	// 	Debugf("AppendEntries: Follower %v: applyMsg: %v#, log: %v#\n", rf.me, applyMsg, rf.log)
-	// 	rf.applyCh <- applyMsg
-	// }
 	reply.Success = true
 	rf.tickerReset()
-	// TODO: Receiver implementation 2-5
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -390,8 +364,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	Debugf("Start-Start: command: %v\n", command)
 	log := logEntry{rf.log[len(rf.log)-1].Index + 1, rf.currentTerm, command}
 	rf.log = append(rf.log, log)
-	rf.nextIndex[rf.me] = log.Index + 1
-	rf.matchIndex[rf.me] = log.Index
 
 	Debugf("Start: return\n")
 	rf.mu.Unlock()
@@ -490,7 +462,6 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
-		Debugf("%v's nextIndex: %v\n", i, rf.nextIndex[i])
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -502,7 +473,6 @@ func (rf *Raft) sendHeartbeats() {
 		reply := &AppendEntriesReply{}
 		go func(i int) {
 			rf.sendAppendEntries(i, args, reply)
-			// TODO: 处理log
 			rf.mu.Lock()
 			if reply.Term > rf.currentTerm {
 				rf.coverTerm(reply.Term)
@@ -510,14 +480,8 @@ func (rf *Raft) sendHeartbeats() {
 			if reply.Success {
 				Debugf("b-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
 				rf.matchIndex[i] = max(rf.matchIndex[i], args.PrevLogIndex+len(args.Entries))
-				rf.nextIndex[i] = rf.matchIndex[i] + 1
 				Debugf("a-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
-			} else {
-				rf.nextIndex[i] = max(rf.matchIndex[i]+1, rf.nextIndex[i]-1)
-				// WARR: 假定不存在匹配不上index为0的log的情况
-				// rf.nextIndex[i]--
 			}
-			// NOTE: 收到reply时,当前server可能已经退位了,需要处理这种情况
 			rf.mu.Unlock()
 		}(i)
 	}
@@ -560,10 +524,6 @@ func (rf *Raft) holdElection() {
 			}
 			if rf.votes > len(rf.peers)/2 {
 				rf.state = Leader
-				// TODO: 赢得选举后,先更新nextIndex和matchIndex信息
-				for i := range rf.peers {
-					rf.nextIndex[i] = len(rf.log)
-				}
 				Debugf("Win the election: %v\n", rf)
 				// TODO: 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
@@ -607,11 +567,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = append(rf.log, logEntry{0, 0, nil})
 	rf.applyCh = applyCh
-	rf.nextIndex = make([]int, len(rf.peers))
-	// NOTE: nextIndex中元素的初始值应为1
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = 1
-	}
 	// NOTE: matchIndex中元素的初始值应为0
 	rf.matchIndex = make([]int, len(rf.peers))
 	// // NOTE: 添加了个无用的logEntry,以便于下标和paper对齐
@@ -663,8 +618,8 @@ func max(a, b int) int {
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) String() string {
-	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v, commitIndex: %v, log: %v, nextIndex: %v, matchIndex :%v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes, rf.secureCommit, rf.log, rf.nextIndex, rf.matchIndex)
+	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v, commitIndex: %v, log: %v, matchIndex :%v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes, rf.secureCommit, rf.log, rf.matchIndex)
 }
 
 func (applyMsg ApplyMsg) String() string {
