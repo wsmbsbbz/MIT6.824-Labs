@@ -93,7 +93,7 @@ type Raft struct {
 	currentTerm int
 	votedFor int // 在当前term未投票时,votedFor = -1
 	// NOTE: protocol: log初始时有一个nil条目,目的是保持log的下标和paper中的index一致
-	log []logEntry // NOTE: temporary
+	log []logEntry
 	// volatile state on all servers:
     lastCommit int
 	commitIndex int
@@ -481,7 +481,7 @@ func (rf *Raft) beater() {
 }
 
 // NOTE: protocol: 此方法应该在一个goroutine中独立运行
-func (rf *Raft) commiter()  {
+func (rf *Raft) committer()  {
 	for rf.killed() == false {
         rf.mu.Lock()
         if rf.state == Leader {
@@ -649,7 +649,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.beater()
-    go rf.commiter()
+    go rf.committer()
 
 	return rf
 }
