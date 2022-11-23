@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"sort"
@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"math/rand"
 
 	"6.824/labrpc"
@@ -125,6 +125,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -134,6 +135,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -154,6 +163,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []logEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		Debugf("readPersist: nil\n")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -324,6 +346,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = append(rf.log, args.Entries[i:]...)
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(
 	// leaderCommit, index of last new entry)
+	rf.persist()
 	rf.secureCommit = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
 	reply.Success = true
 	rf.tickerReset()
@@ -359,6 +382,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	Debugf("Start-Start: command: %v\n", command)
 	log := logEntry{rf.log[len(rf.log)-1].Index + 1, rf.currentTerm, command}
 	rf.log = append(rf.log, log)
+	rf.persist()
 
 	Debugf("Start: return\n")
 	rf.mu.Unlock()
@@ -455,6 +479,7 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
+        // fmt.Printf("me: %v, term: %v, matchIndex: %v, len: %v\n", rf.me, rf.currentTerm, rf.matchIndex, len(rf.log))
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
