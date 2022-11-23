@@ -240,13 +240,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	lastLog := rf.log[len(rf.log)-1]
 	lastLogTerm, lastLogIndex := lastLog.Term, lastLog.Index
-	// ERRO:
-	// if lastLogTerm > args.LastLogTerm || lastLogIndex > args.LastLogIndex {
-	if lastLogTerm > args.LastLogTerm {
-		reply.VoteGranted = false
-		return
-	}
-	if lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex {
+	if (lastLogTerm > args.LastLogTerm) ||
+		(lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
 		reply.VoteGranted = false
 		return
 	}
@@ -448,11 +443,9 @@ func (rf *Raft) committer() {
 				Command:      rf.log[rf.commitIndex].Command,
 				CommandIndex: rf.log[rf.commitIndex].Index,
 			}
-			// go func(applyMsg ApplyMsg) {
 			Debugf("commiter: %v\n", applyMsg)
 			rf.applyCh <- applyMsg
 			Debugf("commiter: %v accepted\n", applyMsg)
-			// }(applyMsg)
 		}
 		rf.mu.Unlock()
 		time.Sleep(timerLoop)
@@ -478,9 +471,9 @@ func (rf *Raft) sendHeartbeats() {
 				rf.coverTerm(reply.Term)
 			}
 			if reply.Success {
-				Debugf("b-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				Debugf("before-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
 				rf.matchIndex[i] = max(rf.matchIndex[i], args.PrevLogIndex+len(args.Entries))
-				Debugf("a-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				Debugf("after-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
 			}
 			rf.mu.Unlock()
 		}(i)
@@ -493,9 +486,8 @@ func (rf *Raft) holdElection() {
 	rf.tickerReset()
 	rf.state = Candidate
 	rf.currentTerm += 1
-	// 自己投自己1票,随后会向自身发送RequestVote RPC请求,但因为votedFor已经>=0,不会再加投自己
-	rf.votes = 1
-	rf.votedFor = rf.me
+	rf.votes = 0
+	rf.votedFor = -1
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -503,9 +495,6 @@ func (rf *Raft) holdElection() {
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
 		reply := &RequestVoteReply{}
 		go func(i int, reply *RequestVoteReply) {
 			rf.sendRequestVote(i, args, reply)
@@ -565,12 +554,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	// // NOTE: 添加了个无用的logEntry,以便于下标和paper对齐
 	rf.log = append(rf.log, logEntry{0, 0, nil})
 	rf.applyCh = applyCh
 	// NOTE: matchIndex中元素的初始值应为0
 	rf.matchIndex = make([]int, len(rf.peers))
-	// // NOTE: 添加了个无用的logEntry,以便于下标和paper对齐
-	// rf.log = append(rf.log, logEntry{0, nil})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
