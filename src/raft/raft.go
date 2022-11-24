@@ -379,7 +379,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	Debugf("Start-Start: command: %v\n", command)
+	Debugf("Start-Start: me: %v command: %v\n", rf.me, command)
 	log := logEntry{rf.log[len(rf.log)-1].Index + 1, rf.currentTerm, command}
 	rf.log = append(rf.log, log)
 	rf.persist()
@@ -457,7 +457,10 @@ func (rf *Raft) committer() {
 			copy(commitNums, rf.matchIndex)
 			sort.Ints(commitNums)
 			rf.commitIndex = rf.secureCommit
-			rf.secureCommit = commitNums[n/2]
+			idx := commitNums[n/2]
+			if rf.log[idx].Term == rf.currentTerm {
+				rf.secureCommit = commitNums[n/2]
+			}
 		}
 		for rf.commitIndex < rf.secureCommit {
 			// TODO: 先apply,再发送到applyCh
@@ -479,7 +482,6 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
-        // fmt.Printf("me: %v, term: %v, matchIndex: %v, len: %v\n", rf.me, rf.currentTerm, rf.matchIndex, len(rf.log))
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -492,6 +494,11 @@ func (rf *Raft) sendHeartbeats() {
 		go func(i int) {
 			rf.sendAppendEntries(i, args, reply)
 			rf.mu.Lock()
+			// in case of term confusion
+			if rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
+			}
 			if reply.Term > rf.currentTerm {
 				rf.coverTerm(reply.Term)
 			}
@@ -526,6 +533,10 @@ func (rf *Raft) holdElection() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			Debugf("RequestVoteReply: me:%v reply: %v\n", rf.me, reply)
+			// in case of term confusion
+			if rf.currentTerm != args.Term {
+				return
+			}
 			if reply.Term > rf.currentTerm {
 				rf.coverTerm(reply.Term)
 				return
@@ -539,6 +550,9 @@ func (rf *Raft) holdElection() {
 			if rf.votes > len(rf.peers)/2 {
 				rf.state = Leader
 				Debugf("Win the election: %v\n", rf)
+				for i := range rf.peers {
+					rf.matchIndex[i] = 0
+				}
 				// TODO: 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
 			}
