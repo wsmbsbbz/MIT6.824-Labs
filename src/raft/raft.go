@@ -229,6 +229,19 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func searchIndex(log []logEntry, target int) int {
+	l, r := 0, len(log)
+	for l < r {
+		m := l + (r-l)/2
+		if log[m].Index < target {
+			l = m + 1
+		} else {
+			r = m
+		}
+	}
+	return l
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -336,8 +349,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// terms), delete the existing entry and all that follow it ($5.3)
 	var i int
 	for i = 0; i < len(args.Entries) && (args.PrevLogIndex+1+i) < len(rf.log); i++ {
-		if !checkLogEqual(rf.log[args.PrevLogIndex+1+i], args.Entries[i]) {
-			rf.log = rf.log[:args.PrevLogIndex+1+i]
+		idx := args.PrevLogIndex+1+i
+		if !checkLogEqual(rf.log[idx], args.Entries[i]) {
+			rf.log = rf.log[:idx]
 			break
 		}
 	}
@@ -465,10 +479,11 @@ func (rf *Raft) committer() {
 		for rf.commitIndex < rf.secureCommit {
 			// TODO: 先apply,再发送到applyCh
 			rf.commitIndex++
+			idx := searchIndex(rf.log, rf.commitIndex)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.commitIndex].Command,
-				CommandIndex: rf.log[rf.commitIndex].Index,
+				Command:      rf.log[idx].Command,
+				CommandIndex: rf.log[idx].Index,
 			}
 			Debugf("commiter: %v\n", applyMsg)
 			rf.applyCh <- applyMsg
@@ -482,12 +497,13 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
+		idx := searchIndex(rf.log, rf.matchIndex[i])
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.matchIndex[i],
-			PrevLogTerm:  rf.log[rf.matchIndex[i]].Term,
-			Entries:      rf.log[rf.matchIndex[i]+1:],
+			PrevLogTerm: rf.log[idx].Term,
+			Entries:      rf.log[idx+1:],
 			LeaderCommit: rf.secureCommit,
 		}
 		reply := &AppendEntriesReply{}
@@ -504,7 +520,9 @@ func (rf *Raft) sendHeartbeats() {
 			}
 			if reply.Success {
 				Debugf("before-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
-				rf.matchIndex[i] = max(rf.matchIndex[i], args.PrevLogIndex+len(args.Entries))
+				if len(args.Entries) > 0 {
+					rf.matchIndex[i] = max(rf.matchIndex[i], args.Entries[len(args.Entries)-1].Index)
+				}
 				Debugf("after-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
 			}
 			rf.mu.Unlock()
