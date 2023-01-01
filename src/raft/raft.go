@@ -229,11 +229,12 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func searchIndex(log []logEntry, target int) int {
-	l, r := 0, len(log)
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+func (rf *Raft) searchLogIndex(target int) int {
+	l, r := 0, len(rf.log)
 	for l < r {
 		m := l + (r-l)/2
-		if log[m].Index < target {
+		if rf.log[m].Index < target {
 			l = m + 1
 		} else {
 			r = m
@@ -341,7 +342,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 2. reply false if log doesn't contain an entry at prevLogIndex whose term
 	// matches prevLogTerm
 	lastLog := rf.log[len(rf.log)-1]
-	if args.PrevLogIndex > lastLog.Index || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	prevLogIndex := rf.searchLogIndex(args.PrevLogIndex)
+	if args.PrevLogIndex > lastLog.Index || rf.log[prevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
@@ -349,7 +351,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// terms), delete the existing entry and all that follow it ($5.3)
 	var i int
 	for i = 0; i < len(args.Entries) && (args.PrevLogIndex+1+i) < len(rf.log); i++ {
-		idx := args.PrevLogIndex+1+i
+		idx := rf.searchLogIndex(args.PrevLogIndex + 1 + i)
 		if !checkLogEqual(rf.log[idx], args.Entries[i]) {
 			rf.log = rf.log[:idx]
 			break
@@ -471,7 +473,7 @@ func (rf *Raft) committer() {
 			copy(commitNums, rf.matchIndex)
 			sort.Ints(commitNums)
 			rf.commitIndex = rf.secureCommit
-			idx := commitNums[n/2]
+			idx := rf.searchLogIndex(commitNums[n/2])
 			if rf.log[idx].Term == rf.currentTerm {
 				rf.secureCommit = commitNums[n/2]
 			}
@@ -479,7 +481,7 @@ func (rf *Raft) committer() {
 		for rf.commitIndex < rf.secureCommit {
 			// TODO: 先apply,再发送到applyCh
 			rf.commitIndex++
-			idx := searchIndex(rf.log, rf.commitIndex)
+			idx := rf.searchLogIndex(rf.commitIndex)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[idx].Command,
@@ -497,12 +499,12 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
-		idx := searchIndex(rf.log, rf.matchIndex[i])
+		idx := rf.searchLogIndex(rf.matchIndex[i])
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.matchIndex[i],
-			PrevLogTerm: rf.log[idx].Term,
+			PrevLogTerm:  rf.log[idx].Term,
 			Entries:      rf.log[idx+1:],
 			LeaderCommit: rf.secureCommit,
 		}
