@@ -193,7 +193,18 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	// WARR: 此处hold rf.mu则会导致程序无法继续推进
+	rf.TrimToIndex(index)
+}
 
+// WARR: 原本需要先hold rf.mu,再调用此方法,但是在Snapshot方法中若hold rf.mu则程序无法推进
+func (rf *Raft) TrimToIndex(index int) {
+	Debugf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
+	idx := rf.searchLogIndex(index)
+	l := []logEntry{rf.log[0]}
+	l = append(l, rf.log[idx+1:]...)
+	rf.log = l
+	Debugf("TrimToIndex: return log: %v\n", rf.log)
 }
 
 // example RequestVote RPC arguments structure.
@@ -231,6 +242,7 @@ type AppendEntriesReply struct {
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) searchLogIndex(target int) int {
+	Debugf("searchLogIndex: target: %v\n", target)
 	l, r := 0, len(rf.log)
 	for l < r {
 		m := l + (r-l)/2
@@ -240,7 +252,7 @@ func (rf *Raft) searchLogIndex(target int) int {
 			r = m
 		}
 	}
-	return l
+	return min(l, rf.log[len(rf.log)-1].Index)
 }
 
 // example RequestVote RPC handler.
@@ -349,12 +361,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 3. If an existing entry conflicts with a new one (same index but different
 	// terms), delete the existing entry and all that follow it ($5.3)
-	var i int
-	for i = 0; i < len(args.Entries) && (args.PrevLogIndex+1+i) < len(rf.log); i++ {
-		idx := rf.searchLogIndex(args.PrevLogIndex + 1 + i)
-		if !checkLogEqual(rf.log[idx], args.Entries[i]) {
-			rf.log = rf.log[:idx]
-			break
+	i, j := 0, 0
+	for i < len(args.Entries) && j < len(rf.log) {
+		if args.Entries[i].Index < rf.log[j].Index {
+			i++
+		} else if args.Entries[i].Index > rf.log[j].Index {
+			j++
+		} else {
+			if !checkLogEqual(args.Entries[i], rf.log[j]) {
+				rf.log = rf.log[:j]
+				break
+			}
+			i++
+			j++
 		}
 	}
 	// 4. Append any new entries not already in the log
