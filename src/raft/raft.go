@@ -104,6 +104,9 @@ type Raft struct {
 
 	// for communicating to clients/testers
 	applyCh chan ApplyMsg
+
+	// for lab 2D
+	snapshot []byte
 }
 
 // return currentTerm and whether this server
@@ -175,6 +178,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = log
 	}
+	Debugf("readPersist: return: %v\n", rf.me)
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -193,16 +197,32 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	// WARR: 此处hold rf.mu则会导致程序无法继续推进
+	Debugf("Snapshot: index: %v %v\n", index, rf)
+	rf.snapshot = snapshot
+	for _, log := range rf.log {
+		if log.Index == index {
+			rf.log[0].Index = log.Index
+			rf.log[0].Term = log.Term
+			break
+		}
+	}
 	rf.TrimToIndex(index)
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), rf.snapshot)
 }
 
 // WARR: 原本需要先hold rf.mu,再调用此方法,但是在Snapshot方法中若hold rf.mu则程序无法推进
 func (rf *Raft) TrimToIndex(index int) {
 	Debugf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
-	idx := rf.searchLogIndex(index)
-	l := []logEntry{rf.log[0]}
-	l = append(l, rf.log[idx+1:]...)
-	rf.log = l
+	if rf.log[len(rf.log)-1].Index <= index {
+		rf.log = rf.log[:1]
+	} else {
+		for i, log := range rf.log {
+			if log.Index > index {
+				rf.log = append([]logEntry{rf.log[0]}, rf.log[i:]...)
+				break
+			}
+		}
+	}
 	Debugf("TrimToIndex: return log: %v\n", rf.log)
 }
 
@@ -239,9 +259,23 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	// doesn't need "offset" and "done" fields
+	Data []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
+// 若log中存在index为对应target的条目,返回目标条目在log中的下标,若不存在目标log,返回-1
 func (rf *Raft) searchLogIndex(target int) int {
-	Debugf("searchLogIndex: target: %v\n", target)
+	Debugf("%v searchLogIndex: target: %v\n", rf.me, target)
 	l, r := 0, len(rf.log)
 	for l < r {
 		m := l + (r-l)/2
@@ -251,7 +285,10 @@ func (rf *Raft) searchLogIndex(target int) int {
 			r = m
 		}
 	}
-	return min(l, rf.log[len(rf.log)-1].Index)
+	if l >= len(rf.log) || rf.log[l].Index != target {
+		return -1
+	}
+	return l
 }
 
 // example RequestVote RPC handler.
@@ -354,7 +391,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// matches prevLogTerm
 	lastLog := rf.log[len(rf.log)-1]
 	prevLogIndex := rf.searchLogIndex(args.PrevLogIndex)
-	if args.PrevLogIndex > lastLog.Index || rf.log[prevLogIndex].Term != args.PrevLogTerm {
+	if prevLogIndex == -1 || args.PrevLogIndex > lastLog.Index || rf.log[prevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
@@ -388,6 +425,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer func() {
+		args.Term = rf.currentTerm
+		rf.mu.Unlock()
+	}()
+	Debugf("InstallSnapshot: start: %v, args: %v\n", rf, args)
+	// Rules for All Servers:
+	// 2. if args.Term > rf.currentTerm, convert to follower
+	if args.Term > rf.currentTerm {
+		rf.coverTerm(args.Term)
+	}
+	if args.Term < rf.currentTerm {
+		return
+	}
+	// Receiver implementation:
+	// 5.save snapshot file
+	rf.snapshot = args.Data
+	// 6. If existing log entry has same index and term as snapshot's last included
+	// entry, retain log entries following it and reply
+	rf.TrimToIndex(args.LastIncludedIndex)
+
+	rf.log[0].Index = args.LastIncludedIndex
+	rf.log[0].Term = args.LastIncludedTerm
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = max(rf.commitIndex, rf.lastApplied)
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), rf.snapshot)
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapshot,
+		SnapshotTerm:  rf.log[0].Term,
+		SnapshotIndex: rf.log[0].Index,
+	}
+	rf.applyCh <- applyMsg
+	Debugf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
+	Debugf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -491,7 +571,8 @@ func (rf *Raft) committer() {
 			commitNums := make([]int, n)
 			copy(commitNums, rf.matchIndex)
 			sort.Ints(commitNums)
-			rf.lastApplied = rf.commitIndex
+			// ERRO: 下面一行代码是什么意思?
+			// rf.lastApplied = rf.commitIndex
 			idx := rf.searchLogIndex(commitNums[n/2])
 			if idx != -1 && rf.log[idx].Term == rf.currentTerm {
 				rf.commitIndex = commitNums[n/2]
@@ -509,6 +590,7 @@ func (rf *Raft) committer() {
 				Command:      rf.log[idx].Command,
 				CommandIndex: rf.log[idx].Index,
 			}
+			Debugf("%v commiter: %v\n", rf.me, rf)
 			Debugf("%v commiter: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
 			rf.applyCh <- applyMsg
 			Debugf("%v commiter: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
@@ -523,16 +605,41 @@ func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
 		go func(i int) {
 			rf.mu.Lock()
-		idx := rf.searchLogIndex(rf.matchIndex[i])
-		args := &AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.matchIndex[i],
-			PrevLogTerm:  rf.log[idx].Term,
-			Entries:      rf.log[idx+1:],
+			idx := rf.searchLogIndex(rf.matchIndex[i])
+			if i != rf.me && idx <= rf.log[0].Index && rf.snapshot != nil {
+				// TODO: send InstallSnapshot RPC
+				args := &InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.log[0].Index,
+					LastIncludedTerm:  rf.log[0].Term,
+					Data:              rf.snapshot,
+				}
+				reply := &InstallSnapshotReply{}
+				rf.mu.Unlock()
+				rf.sendInstallSnapshot(i, args, reply)
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.coverTerm(reply.Term)
+					return
+				}
+				rf.matchIndex[i] = rf.log[0].Index
+			}
+			idx = max(0, rf.searchLogIndex(rf.matchIndex[i]))
+			// ERRO: 已经不是leader了,但是仍然发出了sendAppendEntries
+			if rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.matchIndex[i],
+				PrevLogTerm:  rf.log[idx].Term,
+				Entries:      rf.log[idx+1:],
 				LeaderCommit: rf.commitIndex,
-		}
-		reply := &AppendEntriesReply{}
+			}
+			reply := &AppendEntriesReply{}
 			rf.mu.Unlock()
 			rf.sendAppendEntries(i, args, reply)
 			rf.mu.Lock()
@@ -595,7 +702,8 @@ func (rf *Raft) holdElection() {
 				rf.state = Leader
 				Debugf("Win the election: %v\n", rf)
 				for i := range rf.peers {
-					rf.matchIndex[i] = 0
+					rf.matchIndex[i] = max(rf.matchIndex[i], rf.log[0].Index)
+					// rf.matchIndex[i] = 0
 				}
 				// TODO: 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
@@ -723,6 +831,7 @@ func (rvReply RequestVoteReply) String() string {
 // 	return fmt.Sprintf("Term: %v, Command: %v", entry.Term, entry.Command)
 // }
 
+// const DebugOpen = true
 const DebugOpen = false
 
 func Debugf(format string, v ...interface{}) {
