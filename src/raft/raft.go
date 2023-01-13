@@ -91,9 +91,8 @@ type Raft struct {
 	// NOTE: protocol: log初始时有一个nil条目,目的是保持log的下标和paper中的index一致
 	log []logEntry
 	// volatile state on all servers:
-	commitIndex  int
-	secureCommit int
-	lastApplied  int
+	lastApplied int
+	commitIndex int
 	// volatile state on leaders:
 	matchIndex []int
 
@@ -382,7 +381,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(
 	// leaderCommit, index of last new entry)
 	rf.persist()
-	rf.secureCommit = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
+	rf.commitIndex = min(args.LeaderCommit, max(rf.log[len(rf.log)-1].Index, rf.log[0].Index))
 	reply.Success = true
 	rf.tickerReset()
 }
@@ -408,14 +407,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	// NOTE: protocol: 虽然successCnt不是Raft结构体的字段,但是也要先hold rf.mu.lock再更改
 	rf.mu.Lock()
-	index, term, isLeader := rf.log[len(rf.log)-1].Index+1, rf.currentTerm, rf.state == Leader
+	index, term, isLeader := max(rf.log[len(rf.log)-1].Index+1, rf.log[0].Index+1),
+		rf.currentTerm, rf.state == Leader
 	if rf.state != Leader {
 		rf.mu.Unlock()
 		return index, term, isLeader
 	}
 
-	Debugf("Start-Start: me: %v command: %v\n", rf.me, command)
-	log := logEntry{rf.log[len(rf.log)-1].Index + 1, rf.currentTerm, command}
+	Debugf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
+	log := logEntry{index, term, command}
 	rf.log = append(rf.log, log)
 	rf.persist()
 
@@ -491,24 +491,27 @@ func (rf *Raft) committer() {
 			commitNums := make([]int, n)
 			copy(commitNums, rf.matchIndex)
 			sort.Ints(commitNums)
-			rf.commitIndex = rf.secureCommit
+			rf.lastApplied = rf.commitIndex
 			idx := rf.searchLogIndex(commitNums[n/2])
-			if rf.log[idx].Term == rf.currentTerm {
-				rf.secureCommit = commitNums[n/2]
+			if idx != -1 && rf.log[idx].Term == rf.currentTerm {
+				rf.commitIndex = commitNums[n/2]
 			}
 		}
-		for rf.commitIndex < rf.secureCommit {
+		for rf.lastApplied < rf.commitIndex {
 			// TODO: 先apply,再发送到applyCh
-			rf.commitIndex++
-			idx := rf.searchLogIndex(rf.commitIndex)
+			rf.lastApplied++
+			idx := rf.searchLogIndex(rf.lastApplied)
+			if idx == -1 {
+				break
+			}
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[idx].Command,
 				CommandIndex: rf.log[idx].Index,
 			}
-			Debugf("commiter: %v\n", applyMsg)
+			Debugf("%v commiter: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
 			rf.applyCh <- applyMsg
-			Debugf("commiter: %v accepted\n", applyMsg)
+			Debugf("%v commiter: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
 		rf.mu.Unlock()
 		time.Sleep(timerLoop)
@@ -518,6 +521,8 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
+		go func(i int) {
+			rf.mu.Lock()
 		idx := rf.searchLogIndex(rf.matchIndex[i])
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -525,10 +530,10 @@ func (rf *Raft) sendHeartbeats() {
 			PrevLogIndex: rf.matchIndex[i],
 			PrevLogTerm:  rf.log[idx].Term,
 			Entries:      rf.log[idx+1:],
-			LeaderCommit: rf.secureCommit,
+				LeaderCommit: rf.commitIndex,
 		}
 		reply := &AppendEntriesReply{}
-		go func(i int) {
+			rf.mu.Unlock()
 			rf.sendAppendEntries(i, args, reply)
 			rf.mu.Lock()
 			// in case of term confusion
@@ -640,6 +645,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.log[0].Index
+	rf.commitIndex = rf.lastApplied
+	Debugf("Make: %v\n", rf)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -684,13 +692,13 @@ func max(a, b int) int {
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) String() string {
-	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v, commitIndex: %v, log: %v, matchIndex :%v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes, rf.secureCommit, rf.log, rf.matchIndex)
+	return fmt.Sprintf("me: %v, currentTerm: %v, votedFor: %v, state: %v, votes: %v, lastApplied: %v, commitIndex: %v, log: %v, matchIndex :%v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.state, rf.votes, rf.lastApplied, rf.commitIndex, rf.log, rf.matchIndex)
 }
 
 func (applyMsg ApplyMsg) String() string {
-	return fmt.Sprintf("CommandValid: %v, Command: %v, CommandIndex: %v",
-		applyMsg.CommandValid, applyMsg.Command, applyMsg.CommandIndex)
+	return fmt.Sprintf("CommandValid: %v, Command: %v, CommandIndex: %v, SnapshotValid: %v, SnapshotTerm: %v, SnapshotIndex: %v",
+		applyMsg.CommandValid, applyMsg.Command, applyMsg.CommandIndex, applyMsg.SnapshotValid, applyMsg.SnapshotTerm, applyMsg.SnapshotIndex)
 }
 
 func (aeArgs AppendEntriesArgs) String() string {
