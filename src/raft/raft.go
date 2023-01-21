@@ -114,7 +114,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	term, isLeader := rf.currentTerm, rf.state == Leader
-	Debugf("GetState: %v\n", rf)
+	DPrintf("GetState: %v\n", rf)
 	rf.mu.Unlock()
 	return term, isLeader
 }
@@ -167,13 +167,13 @@ func (rf *Raft) readPersist(data []byte) {
 	var votedFor int
 	var log []logEntry
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
-		Debugf("readPersist: nil\n")
+		DPrintf("readPersist: nil\n")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
 	}
-	Debugf("readPersist: return: %v\n", rf.me)
+	DPrintf("readPersist: return: %v\n", rf.me)
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -192,7 +192,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	// ERRO: 此处hold rf.mu则会导致程序无法继续推进,但有时会出现race condition
-	Debugf("Snapshot: index: %v %v\n", index, rf)
+	DPrintf("Snapshot: index: %v %v\n", index, rf)
 	rf.snapshot = snapshot
 	for _, log := range rf.log {
 		if log.Index == index {
@@ -207,7 +207,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 // WARR: 原本需要先hold rf.mu,再调用此方法,但是在Snapshot方法中若hold rf.mu则程序无法推进
 func (rf *Raft) TrimToIndex(index int) {
-	Debugf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
+	DPrintf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
 	if rf.log[len(rf.log)-1].Index <= index {
 		rf.log = rf.log[:1]
 	} else {
@@ -218,7 +218,7 @@ func (rf *Raft) TrimToIndex(index int) {
 			}
 		}
 	}
-	Debugf("TrimToIndex: return log: %v\n", rf.log)
+	DPrintf("TrimToIndex: return log: %v\n", rf.log)
 }
 
 // example RequestVote RPC arguments structure.
@@ -270,7 +270,7 @@ type InstallSnapshotReply struct {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 // 若log中存在index为对应target的条目,返回目标条目在log中的下标,若不存在目标log,返回-1
 func (rf *Raft) searchLogIndex(target int) int {
-	Debugf("%v searchLogIndex: target: %v\n", rf.me, target)
+	DPrintf("%v searchLogIndex: target: %v\n", rf.me, target)
 	l, r := 0, len(rf.log)
 	for l < r {
 		m := l + (r-l)/2
@@ -290,10 +290,10 @@ func (rf *Raft) searchLogIndex(target int) int {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	Debugf("RequestVote-Start: Raft: %v#, args: %v\n", rf, args)
+	DPrintf("RequestVote-Start: Raft: %v#, args: %v\n", rf, args)
 	defer func() {
 		reply.Term = rf.currentTerm
-		Debugf("RequestVote-End: Raft: %v#, reply: %v\n", rf, reply)
+		DPrintf("RequestVote-End: Raft: %v#, reply: %v\n", rf, reply)
 		rf.mu.Unlock()
 	}()
 
@@ -362,10 +362,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	Debugf("AppendEntries-Start: Raft: %v#, args: %v\n", rf, args)
+	DPrintf("AppendEntries-Start: Raft: %v#, args: %v\n", rf, args)
 	defer func() {
 		reply.Term = rf.currentTerm
-		Debugf("AppendEntries-End: Raft: %v#, reply: %v\n", rf, reply)
+		DPrintf("AppendEntries-End: Raft: %v#, reply: %v\n", rf, reply)
 		rf.mu.Unlock()
 	}()
 
@@ -408,7 +408,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	// 4. Append any new entries not already in the log
-	Debugf("AppendEntries: rf.log: %v#, args.Entries[%v:]: %v\n", rf.log, i, args.Entries[i:])
+	DPrintf("AppendEntries: rf.log: %v#, args.Entries[%v:]: %v\n", rf.log, i, args.Entries[i:])
 	rf.log = append(rf.log, args.Entries[i:]...)
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(
 	// leaderCommit, index of last new entry)
@@ -429,7 +429,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		args.Term = rf.currentTerm
 		rf.mu.Unlock()
 	}()
-	Debugf("InstallSnapshot: start: %v, args: %v\n", rf, args)
+	DPrintf("InstallSnapshot: start: %v, args: %v\n", rf, args)
 	// Rules for All Servers:
 	// 2. if args.Term > rf.currentTerm, convert to follower
 	if args.Term > rf.currentTerm {
@@ -457,8 +457,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: rf.log[0].Index,
 	}
 	rf.applyCh <- applyMsg
-	Debugf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
-	Debugf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
+	DPrintf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
+	DPrintf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -488,12 +488,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	Debugf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
+	DPrintf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
 	log := logEntry{index, term, command}
 	rf.log = append(rf.log, log)
 	rf.persist()
 
-	Debugf("Start: return\n")
+	DPrintf("Start: return\n")
 	rf.mu.Unlock()
 	return index, term, isLeader
 }
@@ -527,8 +527,8 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		if rf.state == Follower || rf.state == Candidate {
 			if time.Now().After(rf.election) {
-				Debugf("ticker: election expires\n")
-				Debugf("me: %v\n", rf)
+				DPrintf("ticker: election expires\n")
+				DPrintf("me: %v\n", rf)
 				rf.holdElection()
 			}
 		}
@@ -544,8 +544,8 @@ func (rf *Raft) beater() {
 		if rf.state == Leader {
 			// NOTE: 每当rf.heartbeat到期后,就发起一轮heartbeat
 			if time.Now().After(rf.heartbeat) {
-				Debugf("beater: heartbeat expires\n")
-				Debugf("leader: %v\n", rf)
+				DPrintf("beater: heartbeat expires\n")
+				DPrintf("leader: %v\n", rf)
 				rf.beaterReset()
 				rf.sendHeartbeats()
 			}
@@ -583,10 +583,10 @@ func (rf *Raft) committer() {
 				Command:      rf.log[idx].Command,
 				CommandIndex: rf.log[idx].Index,
 			}
-			Debugf("%v committer: %v\n", rf.me, rf)
-			Debugf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
+			DPrintf("%v committer: %v\n", rf.me, rf)
+			DPrintf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
 			rf.applyCh <- applyMsg
-			Debugf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
+			DPrintf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
 		rf.mu.Unlock()
 		time.Sleep(timerLoop)
@@ -645,11 +645,11 @@ func (rf *Raft) sendHeartbeats() {
 				rf.coverTerm(reply.Term)
 			}
 			if reply.Success {
-				Debugf("sendHeartbeats-A: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				DPrintf("sendHeartbeats-A: %v's matchIndex: %v", rf.me, rf.matchIndex)
 				if len(args.Entries) > 0 {
 					rf.matchIndex[i] = max(rf.matchIndex[i], args.Entries[len(args.Entries)-1].Index)
 				}
-				Debugf("sendHeartbeats-B: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				DPrintf("sendHeartbeats-B: %v's matchIndex: %v", rf.me, rf.matchIndex)
 			}
 			rf.mu.Unlock()
 		}(i)
@@ -658,7 +658,7 @@ func (rf *Raft) sendHeartbeats() {
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) holdElection() {
-	Debugf("holdElection-Start: %v\n", rf)
+	DPrintf("holdElection-Start: %v\n", rf)
 	rf.tickerReset()
 	rf.state = Candidate
 	rf.currentTerm += 1
@@ -676,7 +676,7 @@ func (rf *Raft) holdElection() {
 			rf.sendRequestVote(i, args, reply)
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			Debugf("RequestVoteReply: me:%v reply: %v\n", rf.me, reply)
+			DPrintf("RequestVoteReply: me:%v reply: %v\n", rf.me, reply)
 			// in case of term confusion
 			if rf.currentTerm != args.Term {
 				return
@@ -693,7 +693,7 @@ func (rf *Raft) holdElection() {
 			}
 			if rf.votes > len(rf.peers)/2 {
 				rf.state = Leader
-				Debugf("Win the election: %v\n", rf)
+				DPrintf("Win the election: %v\n", rf)
 				for i := range rf.peers {
 					rf.matchIndex[i] = max(rf.matchIndex[i], rf.log[0].Index)
 				}
@@ -702,7 +702,7 @@ func (rf *Raft) holdElection() {
 			}
 		}(i, reply)
 	}
-	Debugf("holdElection-End: %v\n", rf)
+	DPrintf("holdElection-End: %v\n", rf)
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
@@ -747,7 +747,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	rf.lastApplied = rf.log[0].Index
 	rf.commitIndex = rf.lastApplied
-	Debugf("Make: %v\n", rf)
+	DPrintf("Make: %v\n", rf)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -762,7 +762,7 @@ func (rf *Raft) coverTerm(term int) {
 	if rf.currentTerm >= term {
 		log.Fatalln("rf.currentTerm >= term")
 	}
-	Debugf("coverTerm: %v, newTerm: %v", rf, term)
+	DPrintf("coverTerm: %v, newTerm: %v", rf, term)
 	rf.currentTerm = term
 	rf.state = Follower
 	rf.votedFor = -1
@@ -819,13 +819,3 @@ func (rvReply RequestVoteReply) String() string {
 	return fmt.Sprintf("Term: %v, VoteGranted: %v", rvReply.Term, rvReply.VoteGranted)
 }
 
-// const DebugOpen = true
-const DebugOpen = false
-
-func Debugf(format string, v ...interface{}) {
-	log.SetFlags(log.Lmicroseconds)
-	if !DebugOpen {
-		return
-	}
-	log.Printf(format, v...)
-}
