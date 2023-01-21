@@ -18,18 +18,16 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"6.824/labrpc"
 	"bytes"
 	"fmt"
 	"log"
+	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"6.824/labgob"
-	"math/rand"
-
-	"6.824/labrpc"
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -66,8 +64,7 @@ const (
 )
 
 type logEntry struct {
-	// NOTE: protocol: 一个正确的Term号从0开始单增,在Make中初始化,但至少在Term号为1时才能
-	// 选出第一个leader,所以logEntry的Term应该从1开始,并保持单增
+	// Raft中的Term应该从0开始单增,在Term至少为1时可以选出第1个leader
 	Index   int
 	Term    int
 	Command interface{}
@@ -88,7 +85,9 @@ type Raft struct {
 	// persistent state on all servers:
 	currentTerm int
 	votedFor    int // 在当前term未投票时,votedFor = -1
-	// NOTE: protocol: log初始时有一个nil条目,目的是保持log的下标和paper中的index一致
+	// 在初始化Raft时,log[0]的Term和Index为Snapshot的LastIncludedTerm和LastIncludedIndex,
+	// 若Raft还没有Snapshot,则Term和Index均为0,此后的log[0]只会在Snapshot时被改变,不受
+	// TrimToIndex()方法的影响
 	log []logEntry
 	// volatile state on all servers:
 	lastApplied int
@@ -100,7 +99,7 @@ type Raft struct {
 	state     int // leader, candidate, follower
 	votes     int
 	heartbeat time.Time
-	election  time.Time // NOTE: 每次收到AppendEntries RPC,会重置election
+	election  time.Time // 每次收到AppendEntries RPC,会重置election计时器
 
 	// for communicating to clients/testers
 	applyCh chan ApplyMsg
@@ -112,10 +111,6 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	// var term int
-	// var isleader bool
-	// return term, isleader
 	// Your code here (2A).
 	rf.mu.Lock()
 	term, isLeader := rf.currentTerm, rf.state == Leader
@@ -196,7 +191,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	// WARR: 此处hold rf.mu则会导致程序无法继续推进
+	// ERRO: 此处hold rf.mu则会导致程序无法继续推进,但有时会出现race condition
 	Debugf("Snapshot: index: %v %v\n", index, rf)
 	rf.snapshot = snapshot
 	for _, log := range rf.log {
@@ -485,7 +480,6 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	// NOTE: protocol: 虽然successCnt不是Raft结构体的字段,但是也要先hold rf.mu.lock再更改
 	rf.mu.Lock()
 	index, term, isLeader := max(rf.log[len(rf.log)-1].Index+1, rf.log[0].Index+1),
 		rf.currentTerm, rf.state == Leader
@@ -527,7 +521,6 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
@@ -590,10 +583,10 @@ func (rf *Raft) committer() {
 				Command:      rf.log[idx].Command,
 				CommandIndex: rf.log[idx].Index,
 			}
-			Debugf("%v commiter: %v\n", rf.me, rf)
-			Debugf("%v commiter: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
+			Debugf("%v committer: %v\n", rf.me, rf)
+			Debugf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
 			rf.applyCh <- applyMsg
-			Debugf("%v commiter: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
+			Debugf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
 		rf.mu.Unlock()
 		time.Sleep(timerLoop)
@@ -626,7 +619,7 @@ func (rf *Raft) sendHeartbeats() {
 				rf.matchIndex[i] = rf.log[0].Index
 			}
 			idx = max(0, rf.searchLogIndex(rf.matchIndex[i]))
-			// ERRO: 已经不是leader了,但是仍然发出了sendAppendEntries
+			// 已经不是leader了,就不应再发出sendAppendEntries
 			if rf.state != Leader {
 				rf.mu.Unlock()
 				return
@@ -652,11 +645,11 @@ func (rf *Raft) sendHeartbeats() {
 				rf.coverTerm(reply.Term)
 			}
 			if reply.Success {
-				Debugf("before-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				Debugf("sendHeartbeats-A: %v's matchIndex: %v", rf.me, rf.matchIndex)
 				if len(args.Entries) > 0 {
 					rf.matchIndex[i] = max(rf.matchIndex[i], args.Entries[len(args.Entries)-1].Index)
 				}
-				Debugf("after-max: %v's matchIndex: %v", rf.me, rf.matchIndex)
+				Debugf("sendHeartbeats-B: %v's matchIndex: %v", rf.me, rf.matchIndex)
 			}
 			rf.mu.Unlock()
 		}(i)
@@ -703,9 +696,8 @@ func (rf *Raft) holdElection() {
 				Debugf("Win the election: %v\n", rf)
 				for i := range rf.peers {
 					rf.matchIndex[i] = max(rf.matchIndex[i], rf.log[0].Index)
-					// rf.matchIndex[i] = 0
 				}
-				// TODO: 赢得选举转化成leader后,应该立刻发出heartbeat
+				// 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
 			}
 		}(i, reply)
@@ -745,10 +737,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	// // NOTE: 添加了个无用的logEntry,以便于下标和paper对齐
+	// 初始化时添加了一个logEntry,以便于下标和paper对齐
 	rf.log = append(rf.log, logEntry{0, 0, nil})
 	rf.applyCh = applyCh
-	// NOTE: matchIndex中元素的初始值应为0
+	// matchIndex中元素的初始值应为0
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
@@ -826,10 +818,6 @@ func (rvArgs RequestVoteArgs) String() string {
 func (rvReply RequestVoteReply) String() string {
 	return fmt.Sprintf("Term: %v, VoteGranted: %v", rvReply.Term, rvReply.VoteGranted)
 }
-
-// func (entry logEntry) String() string {
-// 	return fmt.Sprintf("Term: %v, Command: %v", entry.Term, entry.Command)
-// }
 
 // const DebugOpen = true
 const DebugOpen = false
