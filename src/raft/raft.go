@@ -103,6 +103,7 @@ type Raft struct {
 
 	// for communicating to clients/testers
 	applyCh chan ApplyMsg
+    applyMu sync.Mutex
 
 	// for lab 2D
 	snapshot []byte
@@ -181,7 +182,21 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if lastIncludedIndex < rf.commitIndex {
+		return false
+	}
+
+	rf.TrimToIndex(lastIncludedIndex)
+	rf.log[0].Term = lastIncludedTerm
+	rf.log[0].Index = lastIncludedIndex
+	rf.snapshot = snapshot
+	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 	return true
 }
 
@@ -191,8 +206,9 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	// ERRO: 此处hold rf.mu则会导致程序无法继续推进,但有时会出现race condition
-	DPrintf("Snapshot: index: %v %v\n", index, rf)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("%d Snapshot: index: %v %v\n", rf.me, index, rf)
 	rf.snapshot = snapshot
 	for _, log := range rf.log {
 		if log.Index == index {
@@ -202,10 +218,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		}
 	}
 	rf.TrimToIndex(index)
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), rf.snapshot)
+	rf.matchIndex[rf.me] = max(rf.matchIndex[rf.me], index)
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
-// WARR: 原本需要先hold rf.mu,再调用此方法,但是在Snapshot方法中若hold rf.mu则程序无法推进
+// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) TrimToIndex(index int) {
 	DPrintf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
 	if rf.log[len(rf.log)-1].Index <= index {
@@ -438,25 +456,26 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm {
 		return
 	}
+	// 如果已有足够新的Snapshot,返回即可
+	if args.LastIncludedTerm <= rf.log[0].Term && args.LastIncludedIndex <= rf.log[0].Index {
+		return
+	}
 	// Receiver implementation:
 	// 5.save snapshot file
-	rf.snapshot = args.Data
 	// 6. If existing log entry has same index and term as snapshot's last included
 	// entry, retain log entries following it and reply
-	rf.TrimToIndex(args.LastIncludedIndex)
 
-	rf.log[0].Index = args.LastIncludedIndex
-	rf.log[0].Term = args.LastIncludedTerm
-	rf.lastApplied = args.LastIncludedIndex
-	rf.commitIndex = max(rf.commitIndex, rf.lastApplied)
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), rf.snapshot)
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
-		SnapshotTerm:  rf.log[0].Term,
-		SnapshotIndex: rf.log[0].Index,
+		Snapshot: args.Data,
+		SnapshotTerm: args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
 	}
+	rf.mu.Unlock()
+    rf.applyMu.Lock()
 	rf.applyCh <- applyMsg
+    rf.applyMu.Unlock()
+	rf.mu.Lock()
 	DPrintf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
 	DPrintf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
 }
@@ -564,8 +583,6 @@ func (rf *Raft) committer() {
 			commitNums := make([]int, n)
 			copy(commitNums, rf.matchIndex)
 			sort.Ints(commitNums)
-			// ERRO: 下面一行代码是什么意思?
-			// rf.lastApplied = rf.commitIndex
 			idx := rf.searchLogIndex(commitNums[n/2])
 			if idx != -1 && rf.log[idx].Term == rf.currentTerm {
 				rf.commitIndex = commitNums[n/2]
@@ -575,7 +592,8 @@ func (rf *Raft) committer() {
 			// TODO: 先apply,再发送到applyCh
 			rf.lastApplied++
 			idx := rf.searchLogIndex(rf.lastApplied)
-			if idx == -1 {
+			if rf.lastApplied != 0 && idx == -1 {
+				DPrintf("committer: break")
 				break
 			}
 			applyMsg := ApplyMsg{
@@ -585,7 +603,13 @@ func (rf *Raft) committer() {
 			}
 			DPrintf("%v committer: %v\n", rf.me, rf)
 			DPrintf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
+            rf.applyMu.Lock()
+			rf.mu.Unlock()
+            // WARR: at this point, CondInstallSnapshot may hold the lock then return true,
+            // so there is a dangerous point to cause "apply out of order"
 			rf.applyCh <- applyMsg
+            rf.applyMu.Unlock()
+			rf.mu.Lock()
 			DPrintf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
 		rf.mu.Unlock()
@@ -600,7 +624,6 @@ func (rf *Raft) sendHeartbeats() {
 			rf.mu.Lock()
 			idx := rf.searchLogIndex(rf.matchIndex[i])
 			if i != rf.me && idx <= rf.log[0].Index && rf.snapshot != nil {
-				// TODO: send InstallSnapshot RPC
 				args := &InstallSnapshotArgs{
 					Term:              rf.currentTerm,
 					LeaderId:          rf.me,
@@ -728,21 +751,17 @@ func (rf *Raft) tickerReset() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	// 初始化时添加了一个logEntry,以便于下标和paper对齐
-	rf.log = append(rf.log, logEntry{0, 0, nil})
-	rf.applyCh = applyCh
-	// matchIndex中元素的初始值应为0
-	rf.matchIndex = make([]int, len(rf.peers))
-
+	rf := &Raft{
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		state:       Follower,
+		currentTerm: 0,
+		votedFor:    -1,
+		log:         []logEntry{{0, 0, nil}},
+		applyCh:     applyCh,
+		matchIndex:  make([]int, len(peers)),
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.lastApplied = rf.log[0].Index
@@ -818,4 +837,3 @@ func (rvArgs RequestVoteArgs) String() string {
 func (rvReply RequestVoteReply) String() string {
 	return fmt.Sprintf("Term: %v, VoteGranted: %v", rvReply.Term, rvReply.VoteGranted)
 }
-
