@@ -1,12 +1,16 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"6.824/labrpc"
+	"crypto/rand"
+	"log"
+	"math/big"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastServer int
 }
 
 func nrand() int64 {
@@ -35,6 +39,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
+	args := &GetArgs{key}
+	reply := &GetReply{}
+	snum := []int{ck.lastServer}
+	for i := 0; i < len(ck.servers); i++ {
+		snum = append(snum, i)
+	}
+	for _, v := range snum {
+		ok := ck.servers[v].Call("KVServer.Get", args, reply)
+		if !ok {
+			log.Fatalf("C Get\n")
+		}
+		if reply.Ok {
+			DPrintf("C Get: reply: %v\n", reply)
+			ck.lastServer = v
+			return reply.Value
+		}
+		// return ""
+	}
 	return ""
 }
 
@@ -48,6 +70,25 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := &PutAppendArgs{key, value, op}
+	reply := &PutAppendReply{}
+	snum := []int{ck.lastServer}
+	for i := 0; i < len(ck.servers); i++ {
+		snum = append(snum, i)
+	}
+	for _, v := range snum {
+		ok := ck.servers[v].Call("KVServer.PutAppend", args, reply)
+		if !ok {
+			log.Fatalf("C PutAppend\n")
+		}
+		if reply.Ok {
+			DPrintf("C PutAppend: reply: %v\n", reply)
+			ck.lastServer = v
+			return
+		} else {
+			DPrintf("C PutAppend: not leader, continue...\n")
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

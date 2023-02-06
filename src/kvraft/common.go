@@ -19,6 +19,7 @@ type PutAppendArgs struct {
 }
 
 type PutAppendReply struct {
+	Ok  bool
 	Err Err
 }
 
@@ -28,6 +29,7 @@ type GetArgs struct {
 }
 
 type GetReply struct {
+	Ok    bool
 	Err   Err
 	Value string
 }

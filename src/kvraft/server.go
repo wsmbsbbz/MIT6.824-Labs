@@ -12,16 +12,26 @@ import (
 const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
+	log.SetFlags(log.Lmicroseconds)
 	if Debug {
 		log.Printf(format, a...)
 	}
 	return
 }
 
+const (
+	OpGet int = iota
+	OpPut
+	OpAppend
+)
+
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type int // OpGet, OpPut, OpAppend
+	Key  string
+	Val  string
 }
 
 type KVServer struct {
@@ -34,14 +44,60 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	database map[string]string
+	dNum     int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	// 因为raft库的字段不保留给上层KVServer，所以KVServer使用Start()方法和raft库进行交互
+	DPrintf("S%v Get: args: %v\n", kv.dNum, args)
+	op := Op{OpGet, args.Key, ""}
+	idx, term, isLeader := kv.rf.Start(op)
+	DPrintf("S%v Get: %v, %v, %v\n", kv.dNum, idx, term, isLeader)
+	if isLeader {
+		kv.mu.Unlock()
+		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
+		DPrintf("S%v Get: msg: %v\n", kv.dNum, applyMsg)
+		if applyMsg.CommandValid {
+			reply.Ok = true
+			reply.Value = kv.database[args.Key]
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	DPrintf("S%v PutAppend: args: %v\n", kv.dNum, args)
+	var op Op
+	if args.Op == "Put" {
+		op = Op{OpPut, args.Key, args.Value}
+	} else if args.Op == "Append" {
+		op = Op{OpAppend, args.Key, args.Value}
+	}
+	DPrintf("S%v PutAppend: op: %v\n", kv.dNum, op)
+	idx, term, isLeader := kv.rf.Start(op)
+	DPrintf("S%v PutAppend: %v, %v, %v\n", kv.dNum, idx, term, isLeader)
+	if isLeader {
+		kv.mu.Unlock()
+		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
+		DPrintf("S%v PutAppend: msg: %v\n", kv.dNum, applyMsg)
+		if applyMsg.CommandValid {
+			if args.Op == "Put" {
+				kv.database[args.Key] = args.Value
+			} else if args.Op == "Append" {
+				kv.database[args.Key] += args.Value
+			}
+			DPrintf("S%v database: %v\n", kv.dNum, kv.database)
+			reply.Ok = true
+		}
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -88,6 +144,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.dNum = kv.me
+	kv.database = make(map[string]string)
 
 	// You may need initialization code here.
 
