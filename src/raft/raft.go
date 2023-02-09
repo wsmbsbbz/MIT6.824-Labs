@@ -60,7 +60,6 @@ const (
 	MinTick           = 200 * time.Millisecond
 	TickInterval      = 300 * time.Millisecond
 	HeartbeatInterval = 100 * time.Millisecond
-	timerLoop         = 10 * time.Millisecond
 )
 
 type logEntry struct {
@@ -109,7 +108,8 @@ type Raft struct {
 	snapshot []byte
 
 	// redesign lab 2
-	beaterCond sync.Cond
+	beaterCond    sync.Cond
+	committerCond sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -435,6 +435,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// leaderCommit, index of last new entry)
 	rf.persist()
 	rf.commitIndex = min(args.LeaderCommit, max(rf.log[len(rf.log)-1].Index, rf.log[0].Index))
+	rf.committerCond.Signal()
 	reply.Success = true
 	rf.tickerReset()
 }
@@ -513,6 +514,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
 	log := logEntry{index, term, command}
 	rf.log = append(rf.log, log)
+	rf.sendHeartbeats()
 	rf.persist()
 
 	DPrintf("Start: return\n")
@@ -584,18 +586,8 @@ func (rf *Raft) beater() {
 
 // NOTE: protocol: 此方法应该在一个goroutine中独立运行
 func (rf *Raft) committer() {
+	rf.committerCond.L.Lock()
 	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.state == Leader {
-			n := len(rf.peers)
-			commitNums := make([]int, n)
-			copy(commitNums, rf.matchIndex)
-			sort.Ints(commitNums)
-			idx := rf.searchLogIndex(commitNums[n/2])
-			if idx != -1 && rf.log[idx].Term == rf.currentTerm {
-				rf.commitIndex = commitNums[n/2]
-			}
-		}
 		for rf.lastApplied < rf.commitIndex {
 			// TODO: 先apply,再发送到applyCh
 			rf.lastApplied++
@@ -620,9 +612,9 @@ func (rf *Raft) committer() {
 			rf.mu.Lock()
 			DPrintf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
-		rf.mu.Unlock()
-		time.Sleep(timerLoop)
+		rf.committerCond.Wait()
 	}
+	rf.committerCond.L.Unlock()
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
@@ -681,6 +673,17 @@ func (rf *Raft) sendHeartbeats() {
 					rf.matchIndex[i] = max(rf.matchIndex[i], args.Entries[len(args.Entries)-1].Index)
 				}
 				DPrintf("sendHeartbeats-B: %v's matchIndex: %v", rf.me, rf.matchIndex)
+
+				// NOTE: move this peice of code from committer to here
+				n := len(rf.peers)
+				commitNums := make([]int, n)
+				copy(commitNums, rf.matchIndex)
+				sort.Ints(commitNums)
+				idx := rf.searchLogIndex(commitNums[n/2])
+				if idx != -1 && rf.log[idx].Term == rf.currentTerm {
+					rf.commitIndex = commitNums[n/2]
+					rf.committerCond.Signal()
+				}
 			}
 			rf.mu.Unlock()
 		}(i)
@@ -774,6 +777,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	rf.beaterCond = *sync.NewCond(&rf.mu)
+	rf.committerCond = *sync.NewCond(&rf.mu)
 	go rf.ticker()
 	go rf.beater()
 	go rf.committer()
