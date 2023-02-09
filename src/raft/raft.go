@@ -60,7 +60,6 @@ const (
 	MinTick           = 200 * time.Millisecond
 	TickInterval      = 300 * time.Millisecond
 	HeartbeatInterval = 100 * time.Millisecond
-	timerLoop         = 10 * time.Millisecond
 )
 
 type logEntry struct {
@@ -103,10 +102,14 @@ type Raft struct {
 
 	// for communicating to clients/testers
 	applyCh chan ApplyMsg
-    applyMu sync.Mutex
+	applyMu sync.Mutex
 
 	// for lab 2D
 	snapshot []byte
+
+	// redesign lab 2
+	beaterCond    sync.Cond
+	committerCond sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -432,6 +435,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// leaderCommit, index of last new entry)
 	rf.persist()
 	rf.commitIndex = min(args.LeaderCommit, max(rf.log[len(rf.log)-1].Index, rf.log[0].Index))
+	rf.committerCond.Signal()
 	reply.Success = true
 	rf.tickerReset()
 }
@@ -467,14 +471,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
-		Snapshot: args.Data,
-		SnapshotTerm: args.LastIncludedTerm,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
 	rf.mu.Unlock()
-    rf.applyMu.Lock()
+	rf.applyMu.Lock()
 	rf.applyCh <- applyMsg
-    rf.applyMu.Unlock()
+	rf.applyMu.Unlock()
 	rf.mu.Lock()
 	DPrintf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
 	DPrintf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
@@ -510,6 +514,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
 	log := logEntry{index, term, command}
 	rf.log = append(rf.log, log)
+	rf.sendHeartbeats()
 	rf.persist()
 
 	DPrintf("Start: return\n")
@@ -551,43 +556,38 @@ func (rf *Raft) ticker() {
 				rf.holdElection()
 			}
 		}
+		d := time.Until(rf.election)
 		rf.mu.Unlock()
-		time.Sleep(timerLoop)
+		time.Sleep(d)
 	}
 }
 
 // NOTE: protocol: 此方法应该在一个goroutine中独立运行
 func (rf *Raft) beater() {
+	rf.beaterCond.L.Lock()
 	for rf.killed() == false {
-		rf.mu.Lock()
 		if rf.state == Leader {
 			// NOTE: 每当rf.heartbeat到期后,就发起一轮heartbeat
 			if time.Now().After(rf.heartbeat) {
 				DPrintf("beater: heartbeat expires\n")
 				DPrintf("leader: %v\n", rf)
-				rf.beaterReset()
+				// rf.beaterReset()
 				rf.sendHeartbeats()
 			}
+			go func(d time.Duration) {
+				time.Sleep(d)
+				rf.beaterCond.Signal() // is there a difference between Signal() and Broadcast
+			}(HeartbeatInterval)
 		}
-		rf.mu.Unlock()
-		time.Sleep(timerLoop)
+		rf.beaterCond.Wait()
 	}
+	rf.beaterCond.L.Unlock()
 }
 
 // NOTE: protocol: 此方法应该在一个goroutine中独立运行
 func (rf *Raft) committer() {
+	rf.committerCond.L.Lock()
 	for rf.killed() == false {
-		rf.mu.Lock()
-		if rf.state == Leader {
-			n := len(rf.peers)
-			commitNums := make([]int, n)
-			copy(commitNums, rf.matchIndex)
-			sort.Ints(commitNums)
-			idx := rf.searchLogIndex(commitNums[n/2])
-			if idx != -1 && rf.log[idx].Term == rf.currentTerm {
-				rf.commitIndex = commitNums[n/2]
-			}
-		}
 		for rf.lastApplied < rf.commitIndex {
 			// TODO: 先apply,再发送到applyCh
 			rf.lastApplied++
@@ -603,18 +603,18 @@ func (rf *Raft) committer() {
 			}
 			DPrintf("%v committer: %v\n", rf.me, rf)
 			DPrintf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
-            rf.applyMu.Lock()
+			rf.applyMu.Lock()
 			rf.mu.Unlock()
-            // WARR: at this point, CondInstallSnapshot may hold the lock then return true,
-            // so there is a dangerous point to cause "apply out of order"
+			// WARR: at this point, CondInstallSnapshot may hold the lock then return true,
+			// so there is a dangerous point to cause "apply out of order"
 			rf.applyCh <- applyMsg
-            rf.applyMu.Unlock()
+			rf.applyMu.Unlock()
 			rf.mu.Lock()
 			DPrintf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
 		}
-		rf.mu.Unlock()
-		time.Sleep(timerLoop)
+		rf.committerCond.Wait()
 	}
+	rf.committerCond.L.Unlock()
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
@@ -673,6 +673,17 @@ func (rf *Raft) sendHeartbeats() {
 					rf.matchIndex[i] = max(rf.matchIndex[i], args.Entries[len(args.Entries)-1].Index)
 				}
 				DPrintf("sendHeartbeats-B: %v's matchIndex: %v", rf.me, rf.matchIndex)
+
+				// NOTE: move this peice of code from committer to here
+				n := len(rf.peers)
+				commitNums := make([]int, n)
+				copy(commitNums, rf.matchIndex)
+				sort.Ints(commitNums)
+				idx := rf.searchLogIndex(commitNums[n/2])
+				if idx != -1 && rf.log[idx].Term == rf.currentTerm {
+					rf.commitIndex = commitNums[n/2]
+					rf.committerCond.Signal()
+				}
 			}
 			rf.mu.Unlock()
 		}(i)
@@ -722,15 +733,11 @@ func (rf *Raft) holdElection() {
 				}
 				// 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
+				rf.beaterCond.Signal()
 			}
 		}(i, reply)
 	}
 	DPrintf("holdElection-End: %v\n", rf)
-}
-
-// NOTE: protocol: 必须已经hold rf.mu,再调用此方法
-func (rf *Raft) beaterReset() {
-	rf.heartbeat = time.Now().Add(HeartbeatInterval)
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
@@ -769,6 +776,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("Make: %v\n", rf)
 
 	// start ticker goroutine to start elections
+	rf.beaterCond = *sync.NewCond(&rf.mu)
+	rf.committerCond = *sync.NewCond(&rf.mu)
 	go rf.ticker()
 	go rf.beater()
 	go rf.committer()
