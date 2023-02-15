@@ -102,7 +102,6 @@ type Raft struct {
 
 	// for communicating to clients/testers
 	applyCh chan ApplyMsg
-	applyMu sync.Mutex
 
 	// for lab 2D
 	snapshot []byte
@@ -137,13 +136,7 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.getSerializedState())
 }
 
 // restore previously persisted state.
@@ -185,21 +178,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if lastIncludedIndex < rf.commitIndex {
-		return false
-	}
-
-	rf.TrimToIndex(lastIncludedIndex)
-	rf.log[0].Term = lastIncludedTerm
-	rf.log[0].Index = lastIncludedIndex
-	rf.snapshot = snapshot
-	rf.commitIndex = lastIncludedIndex
-	rf.lastApplied = lastIncludedIndex
-	rf.persist()
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 	return true
 }
 
@@ -212,34 +190,30 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("%d Snapshot: index: %v %v\n", rf.me, index, rf)
-	rf.snapshot = snapshot
-	for _, log := range rf.log {
-		if log.Index == index {
-			rf.log[0].Index = log.Index
-			rf.log[0].Term = log.Term
-			break
-		}
-	}
-	rf.TrimToIndex(index)
+
+	rf.TrimToIndex(min(index-1, rf.lastApplied-1))
 	rf.matchIndex[rf.me] = max(rf.matchIndex[rf.me], index)
-	rf.persist()
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+	rf.snapshot = snapshot
+	rf.persister.SaveStateAndSnapshot(rf.getSerializedState(), snapshot)
 }
 
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) TrimToIndex(index int) {
 	DPrintf("TrimToIndex: before trim: index: %v log: %v\n", index, rf.log)
-	if rf.log[len(rf.log)-1].Index <= index {
-		rf.log = rf.log[:1]
-	} else {
-		for i, log := range rf.log {
-			if log.Index > index {
-				rf.log = append([]logEntry{rf.log[0]}, rf.log[i:]...)
-				break
-			}
-		}
+	for len(rf.log) > 0 && rf.log[0].Index <= index {
+		rf.log = rf.log[1:]
 	}
 	DPrintf("TrimToIndex: return log: %v\n", rf.log)
+}
+
+func (rf *Raft) getSerializedState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	return data
 }
 
 // example RequestVote RPC arguments structure.
@@ -292,19 +266,14 @@ type InstallSnapshotReply struct {
 // 若log中存在index为对应target的条目,返回目标条目在log中的下标,若不存在目标log,返回-1
 func (rf *Raft) searchLogIndex(target int) int {
 	DPrintf("%v searchLogIndex: target: %v\n", rf.me, target)
-	l, r := 0, len(rf.log)
-	for l < r {
-		m := l + (r-l)/2
-		if rf.log[m].Index < target {
-			l = m + 1
-		} else {
-			r = m
+	for i := 0; i < len(rf.log); i++ {
+		if rf.log[i].Index == target {
+			DPrintf("%v searchLogIndex-return: %v\n", rf.me, i)
+			return i
 		}
 	}
-	if l >= len(rf.log) || rf.log[l].Index != target {
-		return -1
-	}
-	return l
+	DPrintf("%v searchLogIndex: -1\n", rf.me)
+	return -1
 }
 
 // example RequestVote RPC handler.
@@ -460,14 +429,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// 如果已有足够新的Snapshot,返回即可
-	if args.LastIncludedTerm <= rf.log[0].Term && args.LastIncludedIndex <= rf.log[0].Index {
-		return
-	}
 	// Receiver implementation:
 	// 5.save snapshot file
+	rf.snapshot = args.Data
+	rf.persister.SaveStateAndSnapshot(rf.getSerializedState(), rf.snapshot)
+
 	// 6. If existing log entry has same index and term as snapshot's last included
 	// entry, retain log entries following it and reply
+	idx := rf.searchLogIndex(args.LastIncludedIndex)
+	if idx != -1 && rf.log[idx].Term == args.LastIncludedTerm {
+		rf.TrimToIndex(min(rf.lastApplied-1, args.LastIncludedIndex-1))
+		return
+	}
 
 	applyMsg := ApplyMsg{
 		SnapshotValid: true,
@@ -475,13 +448,25 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	rf.mu.Unlock()
-	rf.applyMu.Lock()
-	rf.applyCh <- applyMsg
-	rf.applyMu.Unlock()
-	rf.mu.Lock()
-	DPrintf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
-	DPrintf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
+	go func(applyMsg ApplyMsg) {
+		DPrintf("%v waiting for applyCh, SnapshotIndex: %v\n", rf.me, applyMsg.SnapshotIndex)
+		rf.applyCh <- applyMsg
+		DPrintf("%v applyCh accepted\n", rf.me)
+		DPrintf("InstallSnapshot: ApplyMsg %v accepted\n", applyMsg)
+		rf.mu.Lock()
+		// 7. Discard entire log
+		DPrintf("%v Pre discard: log: %v\n", rf.me, rf.log)
+		rf.log = []logEntry{{args.LastIncludedIndex, args.LastIncludedTerm, nil}}
+		DPrintf("%v After discard: log: %v\n", rf.me, rf.log)
+
+		// 8. Reset state machine using snapshot contents(and load
+		// snapshot's cluster configuration)
+		rf.commitIndex = args.LastIncludedIndex
+		rf.lastApplied = args.LastIncludedIndex
+		rf.persister.SaveStateAndSnapshot(rf.getSerializedState(), rf.snapshot)
+		DPrintf("InstallSnapshot: return: %v, reply: %v\n", rf, reply)
+		rf.mu.Unlock()
+	}(applyMsg)
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -514,6 +499,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("Start-Start: %v, %v, %v, command: %v\n", index, term, isLeader, command)
 	log := logEntry{index, term, command}
 	rf.log = append(rf.log, log)
+	rf.matchIndex[rf.me] = log.Index
 	rf.sendHeartbeats()
 	rf.persist()
 
@@ -593,6 +579,7 @@ func (rf *Raft) committer() {
 			rf.lastApplied++
 			idx := rf.searchLogIndex(rf.lastApplied)
 			if rf.lastApplied != 0 && idx == -1 {
+				rf.lastApplied--
 				DPrintf("committer: break")
 				break
 			}
@@ -602,15 +589,12 @@ func (rf *Raft) committer() {
 				CommandIndex: rf.log[idx].Index,
 			}
 			DPrintf("%v committer: %v\n", rf.me, rf)
-			DPrintf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
-			rf.applyMu.Lock()
 			rf.mu.Unlock()
-			// WARR: at this point, CondInstallSnapshot may hold the lock then return true,
-			// so there is a dangerous point to cause "apply out of order"
+			DPrintf("%v committer: lastApplied: %v, %v\n", rf.me, rf.lastApplied, applyMsg)
 			rf.applyCh <- applyMsg
-			rf.applyMu.Unlock()
-			rf.mu.Lock()
+			// WARR: 这里可能会有Read Race,不影响程序正确性
 			DPrintf("%v committer: lastApplied: %v, %v accepted\n", rf.me, rf.lastApplied, applyMsg)
+			rf.mu.Lock()
 		}
 		rf.committerCond.Wait()
 	}
@@ -620,10 +604,18 @@ func (rf *Raft) committer() {
 // NOTE: protocol: 必须已经hold rf.mu,再调用此方法
 func (rf *Raft) sendHeartbeats() {
 	for i := range rf.peers {
+		if i == rf.me {
+			rf.tickerReset()
+			continue
+		}
 		go func(i int) {
 			rf.mu.Lock()
 			idx := rf.searchLogIndex(rf.matchIndex[i])
-			if i != rf.me && idx <= rf.log[0].Index && rf.snapshot != nil {
+			// if i != rf.me && idx <= rf.log[0].Index && rf.snapshot != nil {
+			if idx == -1 && rf.snapshot == nil {
+				panic("sendHeartbeats\n")
+			}
+			if idx == -1 && rf.snapshot != nil {
 				args := &InstallSnapshotArgs{
 					Term:              rf.currentTerm,
 					LeaderId:          rf.me,
@@ -641,7 +633,7 @@ func (rf *Raft) sendHeartbeats() {
 				}
 				rf.matchIndex[i] = rf.log[0].Index
 			}
-			idx = max(0, rf.searchLogIndex(rf.matchIndex[i]))
+			idx = rf.searchLogIndex(rf.matchIndex[i])
 			// 已经不是leader了,就不应再发出sendAppendEntries
 			if rf.state != Leader {
 				rf.mu.Unlock()
@@ -684,6 +676,8 @@ func (rf *Raft) sendHeartbeats() {
 					rf.commitIndex = commitNums[n/2]
 					rf.committerCond.Signal()
 				}
+			} else {
+				rf.matchIndex[i] = max(0, rf.matchIndex[i]-1)
 			}
 			rf.mu.Unlock()
 		}(i)
