@@ -57,7 +57,7 @@ const (
 	Candidate = 2
 	Follower  = 3
 	// timing
-	MinTick           = 200 * time.Millisecond
+	MinTick           = 150 * time.Millisecond
 	TickInterval      = 300 * time.Millisecond
 	HeartbeatInterval = 100 * time.Millisecond
 )
@@ -315,6 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.tickerReset()
 }
 
 // example code to send a RequestVote RPC to a server.
