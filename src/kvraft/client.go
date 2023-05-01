@@ -11,6 +11,26 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	lastServer int
+	// use nrand()
+	ClerkID int64
+	// default is 0, increment
+	ReqID int
+}
+
+type Queue []int
+
+func (q *Queue) Len() int {
+	return len(*q)
+}
+
+func (q *Queue) Pop() int {
+	ret := (*q)[0]
+	(*q) = (*q)[1:]
+	return ret
+}
+
+func (q *Queue) Push(x int) {
+	(*q) = append((*q), x)
 }
 
 func nrand() int64 {
@@ -24,6 +44,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.ClerkID = nrand()
+	ck.ReqID = 1
 	return ck
 }
 
@@ -38,25 +60,33 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
+	DPrintf("C Get: key: \"%v\"\n", key)
 	// You will have to modify this function.
-	args := &GetArgs{key}
+	args := &GetArgs{key, ck.ClerkID, ck.ReqID}
+	ck.ReqID++
 	reply := &GetReply{}
-	snum := []int{ck.lastServer}
+	snum := Queue{ck.lastServer}
 	for i := 0; i < len(ck.servers); i++ {
-		snum = append(snum, i)
+		snum.Push(i)
 	}
-	for _, v := range snum {
+	for snum.Len() > 0 {
+		v := snum.Pop()
 		ok := ck.servers[v].Call("KVServer.Get", args, reply)
 		if !ok {
-			log.Fatalf("C Get\n")
+			DPrintf("C Get: not ok\n")
+			snum.Push(v)
+			continue
 		}
 		if reply.Ok {
 			DPrintf("C Get: reply: %v\n", reply)
 			ck.lastServer = v
 			return reply.Value
+		} else {
+			snum.Push(v)
+			DPrintf("C Get: not leader, continue...\n")
 		}
-		// return ""
 	}
+	log.Fatal("fatal")
 	return ""
 }
 
@@ -70,22 +100,29 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := &PutAppendArgs{key, value, op}
+	DPrintf("C PutAppend: key: \"%v\", value: \"%v\", op: %v\n", key, value, op)
+	args := &PutAppendArgs{key, value, op, ck.ClerkID, ck.ReqID}
+	ck.ReqID++
 	reply := &PutAppendReply{}
-	snum := []int{ck.lastServer}
+	// reply := make(chan PutAppendReply)
+	snum := Queue{ck.lastServer}
 	for i := 0; i < len(ck.servers); i++ {
-		snum = append(snum, i)
+		snum.Push(i)
 	}
-	for _, v := range snum {
+	for snum.Len() > 0 {
+		v := snum.Pop()
 		ok := ck.servers[v].Call("KVServer.PutAppend", args, reply)
 		if !ok {
-			log.Fatalf("C PutAppend\n")
+			DPrintf("C PutAppend: not ok\n")
+			snum.Push(v)
+			continue
 		}
 		if reply.Ok {
 			DPrintf("C PutAppend: reply: %v\n", reply)
 			ck.lastServer = v
 			return
 		} else {
+			snum.Push(v)
 			DPrintf("C PutAppend: not leader, continue...\n")
 		}
 	}
