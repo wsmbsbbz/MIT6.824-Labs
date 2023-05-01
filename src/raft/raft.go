@@ -57,7 +57,7 @@ const (
 	Candidate = 2
 	Follower  = 3
 	// timing
-	MinTick           = 200 * time.Millisecond
+	MinTick           = 150 * time.Millisecond
 	TickInterval      = 300 * time.Millisecond
 	HeartbeatInterval = 100 * time.Millisecond
 )
@@ -315,6 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.tickerReset()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -445,7 +446,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	idx := rf.searchLogIndex(args.LastIncludedIndex)
 	// NOTE: 此处的改动可能是不必要的
 	if (rf.log[0].Index >= args.LastIncludedIndex) || (idx != -1 && rf.log[idx].Term == args.LastIncludedTerm) {
-		rf.TrimToIndex(min(rf.lastApplied-1, args.LastIncludedIndex-1))
+		// rf.TrimToIndex(min(rf.lastApplied-1, args.LastIncludedIndex-1))
 		return
 	}
 
@@ -734,7 +735,8 @@ func (rf *Raft) holdElection() {
 				rf.state = Leader
 				DPrintf("Win the election: %v\n", rf)
 				for i := range rf.peers {
-					rf.matchIndex[i] = max(rf.matchIndex[i], rf.log[0].Index)
+					// rf.matchIndex[i] = max(rf.matchIndex[i], rf.log[0].Index)
+					rf.matchIndex[i] = 0
 				}
 				// 赢得选举转化成leader后,应该立刻发出heartbeat
 				rf.sendHeartbeats()
